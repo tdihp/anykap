@@ -1,0 +1,10 @@
+[project]
+name = "AnyKap"
+version = "0.1.0"
+description = "A simple toolkit aiding capturing in Kubernetes Linux nodes"
+requires-python = ">=3.9"
+authors = [
+    {name = "Ping He", email="tdihp@hotmail.com"},
+]
+readme = "README.md"
+license = {text = "MIT License"}
