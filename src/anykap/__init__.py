@@ -593,15 +593,19 @@ class ShellTask(Task):
         self.stdout_mode = stdout_mode
         self.stderr_mode = stderr_mode
 
-        if isinstance(stdout_filter, str):
-            stdout_filter = re.compile(stdout_filter)
-        if not isinstance(stdout_filter, re.Pattern):
-            raise ValueError('provided stdout_filter %r is not valid' % stdout_filter)
+        if stdout_filter:
+            if isinstance(stdout_filter, str):
+                logger.debug('compiling stdout filter %r', stdout_filter)
+                stdout_filter = re.compile(stdout_filter)
+            elif not isinstance(stdout_filter, re.Pattern):
+                raise ValueError('provided stdout_filter %r is not valid' % stdout_filter)
         self.stdout_filter = stdout_filter
-        if isinstance(stderr_filter, str):
-            stdout_filter = re.compile(stderr_filter)
-        if not isinstance(stdout_filter, re.Pattern):
-            raise ValueError('provided stderr_filter %r is not valid' % stderr_filter)
+        if stderr_filter:
+            if isinstance(stderr_filter, str):
+                logger.debug('compiling stderr filter %r', stderr_filter)
+                stderr_filter = re.compile(stderr_filter)
+            elif not isinstance(stdout_filter, re.Pattern):
+                raise ValueError('provided stderr_filter %r is not valid' % stderr_filter)
         self.stderr_filter = stderr_filter
 
     def run_task(self):
@@ -642,8 +646,43 @@ class ShellTask(Task):
                 encoding=self.encoding, errors=self.errors,
                 stdout=stdout, stderr=stderr,
             )
+            selector = selectors.DefaultSelector()
+            if self.stdout_mode == 'notify':
+                selector.register(p.stdout.fileno(),
+                                  selectors.EVENT_READ,
+                                  (p.stdout, self.stdout_filter, 'stdout'))
+            if self.stderr_mode == 'notify':
+                selector.register(p.stderr.fileno(),
+                                  selectors.EVENT_READ,
+                                  (p.stderr, self.stderr_filter, 'stderr'))
+
             while True:
+                for key, mask in selector.select(self.CADENCE):
+                    f, pattern, name = key.data
+                    for line in f.readlines():
+                        logger.debug('processing line %r', line)
+                        extra = {}
+                        if pattern:
+                            logger.debug('pattern: %r, line: %r', pattern, line)
+                            m = pattern.search(line)
+                            if not m:
+                                continue
+                            extra = {
+                                'groups': m.groups(),
+                                'groupdict': m.groupdict(),
+                            }
+                        event = {
+                            'kind': 'shell',
+                            'topic': 'line',
+                            'output': name,
+                            'line': line,
+                            'task_name': self.name,
+                        }
+                        event.update(extra)
+                        self.send_event(event)
+
                 result = p.poll()
+                
                 # try:
                 #     result = p.wait(self.CADENCE)
                 # except subprocess.TimeoutExpired:

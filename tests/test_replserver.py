@@ -6,17 +6,13 @@ import contextlib
 
 
 @pytest.fixture
-def replserver(tmp_path, caplog):
-    """prepares the hq for us"""
-    caplog.set_level(logging.DEBUG)
-
+def replserver(tmp_path):
     class MyREPLServer(REPLServer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.commands = {
                 'ping': self.cmd_ping,
                 'nping': self.cmd_nping,
-                'endtest': self.cmd_endtest,
             }
 
         def cmd_ping(self):
@@ -26,13 +22,6 @@ def replserver(tmp_path, caplog):
         def cmd_nping(self, num):
             return ['pong'] * int(num)
 
-        def cmd_endtest(self):
-            print('ending test')
-            self.exit()
-            assert self.need_exit()
-            self.hq.running = False
-            return []
-
         def need_exit(self):
             """should be tested in run"""
             print('need_exit called')
@@ -41,7 +30,9 @@ def replserver(tmp_path, caplog):
             return result
 
     unixsocketpath = tmp_path / 'server.unix'
-    return MyREPLServer(path=unixsocketpath, idle_timeout=1)
+    result = MyREPLServer(path=unixsocketpath, idle_timeout=1)
+    yield result
+    result.exit()
 
 
 class REPLClient(object):
@@ -79,55 +70,34 @@ class REPLClient(object):
         self.sk.close()
 
 
-def test_ok(replserver, caplog):
-    caplog.set_level(logging.DEBUG)
-    hq = HQ()
+@pytest.fixture
+def replclient(hq, hqthread, replserver):
     hq.add_task(replserver)
-    hqthread = threading.Thread(target=hq.run)
     hqthread.start()
     for i in range(10):
         if not replserver.path.exists():
-            time.sleep(1)
+            time.sleep(0.1)
         else:
             break
 
+    time.sleep(0.1)
     with contextlib.closing(REPLClient(replserver.path)) as client:
-        result = client.query('ping')
-        assert result == ['OK', 'pong']
-        result = client.query('nping', '10')
-        assert result == ['OK'] + ['pong'] * 10
-        result = client.query('nping', '100')
-        assert result == ['OK'] + ['pong'] * 100
-        result = client.query('nping', '1000')
-        assert result == ['OK'] + ['pong'] * 1000
-        result = client.query('endtest')
-        assert result == ['OK']
-
-    hqthread.join(timeout=3)  # it should be fairly quick
-    assert not hqthread.is_alive()
-    # assert False
+        yield client
 
 
-def test_idle(replserver, caplog):
-    caplog.set_level(logging.DEBUG)
-    hq = HQ()
-    hq.add_task(replserver)
-    hqthread = threading.Thread(target=hq.run)
-    hqthread.start()
-    for i in range(10):
-        if not replserver.path.exists():
-            time.sleep(0.01)
-        else:
-            break
+def test_ok(replclient):
+    result = replclient.query('ping')
+    assert result == ['OK', 'pong']
+    result = replclient.query('nping', '10')
+    assert result == ['OK'] + ['pong'] * 10
+    result = replclient.query('nping', '100')
+    assert result == ['OK'] + ['pong'] * 100
+    result = replclient.query('nping', '1000')
+    assert result == ['OK'] + ['pong'] * 1000
 
-    with contextlib.closing(REPLClient(replserver.path)) as client:
-        # let's try a regular one
-        assert client.query('ping') == ['OK', 'pong']
-        time.sleep(1.5) #  wait until idles
-        with pytest.raises(BrokenPipeError):
-            client.send('ping')
 
-    with contextlib.closing(REPLClient(replserver.path)) as client:
-        assert client.query('endtest') == ['OK']
-    hqthread.join(timeout=3)  # it should be fairly quick
-    assert not hqthread.is_alive()
+def test_idle(replclient):
+    assert replclient.query('ping') == ['OK', 'pong']
+    time.sleep(1.5) #  wait until idles
+    with pytest.raises(BrokenPipeError):
+        replclient.send('ping')
