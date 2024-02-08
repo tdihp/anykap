@@ -17,6 +17,9 @@ import re
 import shlex
 import asyncio
 import selectors
+import tempfile
+import io
+import math
 
 logger = logging.getLogger('anykap')
 
@@ -61,7 +64,7 @@ class HQ(object):
         self._lock = threading.RLock()
         self.queue = queue.SimpleQueue()
         self.artifact_counter = it.count()
-        self.artifacts = []
+        self.artifacts = set()
         self.logger = logger.getChild('HQ')
 
     def run(self):
@@ -126,7 +129,7 @@ class HQ(object):
         """tasks should call this to transmit new events"""
         self.queue.put(event)
 
-    def new_artifact(self, name, keep=True):
+    def new_artifact(self, name, keep=True, context=None):
         artifact_name = self.gen_artifact_name(name)
         path = self.datapath / name
         if path.exists():
@@ -134,7 +137,8 @@ class HQ(object):
 
         path.mkdir(parents=True)
         artifact = Artifact(artifact_name, path, keep)
-        self.artifacts.append(artifact)
+        with self._lock:
+            self.artifacts.add(artifact)
         artifact.hq = self
         return artifact
 
@@ -143,6 +147,9 @@ class HQ(object):
         cnt = next(self.artifact_counter)
         return f'{now}-{name}-{cnt}'
 
+    def forget_artifact(self, artifact):
+        with self._lock:
+            self.artifacts.discard(artifact)
 
 class Receptor(object):
     """
@@ -287,11 +294,6 @@ class Task(threading.Thread):
 
 class Compressor(object):
     """"""
-    pass
-
-
-class Uploader(object):
-    """upload a file"""
     pass
 
 
@@ -459,8 +461,9 @@ class CRIImage(CRICtlData):
 
 class Artifact(object):
     """
-    Claims a artifact for saving data
-    
+    Claims a path for saving data. Task shouldn't write any data to disk without
+    requesting an Artifact.
+
     HQ tracks artifact's progress so data can be presented and/or uploaded.
     Artifact is strictly speaking not bound to Tasks, while in reality it should
     be.
@@ -471,8 +474,8 @@ class Artifact(object):
             (artifact.path / 'out.file').write('hello')
     
     """
-
-    def __init__(self, name:str, path:Path, keep=True):
+    
+    def __init__(self, name:str, path:Path, keep=True, context:Any=None):
         """keep is a hint on whether we intend to keep it.
         Some commands might just need a working dir for artifact.
         """
@@ -486,6 +489,10 @@ class Artifact(object):
         self.handler = None
         self.lock = threading.RLock()
         self.keep = True
+        self.context = context
+        self.upload_state = None  # None / 'uploading' / complete
+        self.upload_attempts = 0
+        self.last_upload_failure = None
 
     def start(self):
         with self.lock:
@@ -563,7 +570,7 @@ class ShellTask(Task):
     RESULT_FILE = 'sh.result'
     SIGTERM_TIMEOUT = 10
     SIGKILL_TIMEOUT = 3
-    CADENCE=0.1
+    CADENCE = 0.2
 
     def __init__(self,
                  name,
@@ -598,14 +605,16 @@ class ShellTask(Task):
                 logger.debug('compiling stdout filter %r', stdout_filter)
                 stdout_filter = re.compile(stdout_filter)
             elif not isinstance(stdout_filter, re.Pattern):
-                raise ValueError('provided stdout_filter %r is not valid' % stdout_filter)
+                raise ValueError('provided stdout_filter %r is not valid'
+                                 % stdout_filter)
         self.stdout_filter = stdout_filter
         if stderr_filter:
             if isinstance(stderr_filter, str):
                 logger.debug('compiling stderr filter %r', stderr_filter)
                 stderr_filter = re.compile(stderr_filter)
             elif not isinstance(stdout_filter, re.Pattern):
-                raise ValueError('provided stderr_filter %r is not valid' % stderr_filter)
+                raise ValueError('provided stderr_filter %r is not valid'
+                                 % stderr_filter)
         self.stderr_filter = stderr_filter
 
     def run_task(self):
@@ -682,11 +691,6 @@ class ShellTask(Task):
                         self.send_event(event)
 
                 result = p.poll()
-                
-                # try:
-                #     result = p.wait(self.CADENCE)
-                # except subprocess.TimeoutExpired:
-                #     pass
 
                 is_timeout = self.timeout and (
                     time.monotonic() - start_time > self.timeout)
@@ -881,9 +885,10 @@ class REPLServerProtocol(asyncio.Protocol):
         Noting that newline is the only control charater that should always be
         honored. (Yes this is a limited protocol, not for binary/arbitary
         transfer)
+
+    User can use `nc -CU <file>` to access the unix socket for plain text
+    interaction.
     """
-    # MAX_REQUEST = 1024
-    # IDLE_TIMEOUT = 300  # 5 mins should be enough
     def __init__(self, server,
                  newline=b'\r\n', idle_timeout=300, max_request=1024):
         self.newline = newline
@@ -891,11 +896,12 @@ class REPLServerProtocol(asyncio.Protocol):
         self.max_request = max_request
         self.server = server
         self.logger = logger.getChild(self.__class__.__name__)
-        self.logger.info('protocol created')
+        self.logger.debug('protocol created')
 
 
     def on_timeout(self, progress):
-        logger.debug('our check: %d, current progress: %d', progress, self.progress)
+        logger.debug('progress timing out: %d, current progress: %d',
+                     progress, self.progress)
         if self.progress > progress: 
             return  # client made progress, not timeout
         else:
@@ -1075,3 +1081,188 @@ class HQREPLServer(REPLServer):
                 task.exit()
                 result.append(task.name)
         return result
+
+
+def archive_tar(datapath:str, outpath:str,
+                compressor:Literal[None,'gz','bz2','xz']='gz'):
+    import tarfile
+    suffix = '.tar'
+    tarmode = 'w'
+    if compressor:
+        suffix += '.' + compressor
+        tarmode += ':' + compressor
+
+    fd, fpath = tempfile.mkstemp(dir=outpath, prefix='archive-', suffix=suffix)
+    stack = contextlib.ExitStack()
+    try:
+        with stack:
+            f = stack.enter_context(open(fd, 'wb'))
+            tf = stack.enter_context(
+                tarfile.open(fileobj=f, mode=tarmode)
+            )
+            tf.add(datapath)
+    except Exception:
+        os.remove(fpath)
+        raise
+
+
+def archive_zip(datapath:str, outpath:str, ):
+    import zipfile
+    fd, fpath = tempfile.mkstemp(dir=outpath, prefix='archive-', suffix='.zip')
+    stack = contextlib.ExitStack()
+    try:
+        with stack:
+            f = stack.enter_context(open(fd, 'wb'))
+            zf = stack.enter_context(
+                zipfile.ZipFile(f, mode='w', compression=zipfile.ZIP_DEFLATED))
+            
+            for dirpath, dirnames, filenames in os.walk(datapath):
+                print(f'walking {dirpath}')
+                for fn in filenames:
+                    print(fn)
+                    zf.write(os.path.join(dirpath, fn))
+    except Exception:
+        os.remove(fpath)
+        raise
+
+
+class ArtifactRule(object):
+    """The defult rule for processing artifacts"""
+    def __init__(self, hq, upload_attempts=3, max_backoff=60):
+        self.logger = logger.getChild(self.__class__.__name__)
+        self.hq = hq
+        self.upload_attempts = upload_attempts
+        # delay = e^(k * n) - 1 --> k = log(delay - 1) / n
+        k = math.log(max_backoff - 1) / (upload_attempts - 1)
+        self.retry_ladder = [math.exp(k * i) for i in range(1, upload_attempts)]
+        self.timers = []
+
+    def __call__(self, event):
+        hq = self.hq
+        uploader = hq.uploader
+
+        if event.get('kind') != 'artifact':
+            return
+
+        logger = self.logger
+        artifact = event['artifact']
+
+        if not artifact.keep:
+            if not event['topic'] == 'complete':
+                logger.warning('not sure what this event is: %r', event)
+                return
+            # we clean up and forget the thing if not meant to be kept
+            try:
+                shutil.rmtree(str(artifact.path))
+            except Exception:
+                self.logger.exception(
+                    'failed removing files for artifact %r', artifact)
+            hq.forget_artifact(artifact)
+
+        if not uploader:
+            logger.debug('uploader not configured, not uploading %r', artifact)
+            return
+
+        if event['topic'] not in ['complete', 'upload_failure']:
+            logger.warning('not sure what this event is: %r', event)
+            return
+
+        if event['topic'] == 'complete':
+            uploader.upload(artifact)
+        elif event['topic'] == 'upload_failure':
+            if artifact.upload_attempts >= self.upload_attempts:
+                logger.warning('upload retries exhausted for artifact %r',
+                               artifact)
+                return
+            assert 0 <= artifact.upload_attempts < self.upload_attempts
+            self.timers.append(
+                threading.Timer(self.retry_ladder[artifact.upload_attempts], uploader.upload, [artifact]))
+        else:
+            logger.warning('not sure what this event is: %r', event)
+            return
+
+        if artifact.upload_attempts > self.upload_attempts:
+            logger.warning('upload retries exhausted for artifact %r', artifact)
+            return
+        
+
+
+        hq.uploader()
+
+class Uploader(object):
+    """uploader is a retryable interface for uploading a single artifact
+    """
+    def __init__(self):
+        self.logger = logger.getChild(self.__class__.__name__)
+
+    def upload(self, artifact:Artifact):
+        # no error means upload started. Noting it doesn't guarantee upload
+        # success
+        with artifact.lock:
+            if artifact.state != 'complete':
+                raise RuntimeError(
+                    'uploading artifact %r not in complete state' % artifact)
+            assert artifact.upload_state == None
+            artifact.upload_state = 'uploading'
+            artifact.upload_attempts += 1
+
+        try:
+            self.try_upload(artifact)
+        except Exception:
+            self.logger.exception('when attempting upload %r', artifact)
+            self.fail(artifact)
+
+    def try_upload(self, artifact):
+        """concrete implementation of the uploading logic"""
+        raise NotImplementedError
+
+    def upload_complete(self, artifact):
+        with artifact.lock:
+            assert artifact.state == 'complete'
+            assert artifact.upload_state == 'uploading'
+            artifact.upload_state = 'complete'
+        self.hq.send_event({
+            'kind': 'artifact',
+            'topic': 'upload_complete',
+            'artifact': artifact})
+
+    def fail(self, artifact):
+        with artifact.lock:
+            assert artifact.upload_state == 'uploading'
+            artifact.upload_state = None
+
+        self.hq.send_event({
+            'kind': 'artifact',
+            'topic': 'upload_failure',
+            'artifact': artifact,
+        })
+
+
+class QueuedUploader(Task):
+    CADENCE = 0.2
+    def __init__(self, name, uploader:Uploader):
+        super().__init__()
+        self.queue = queue.SimpleQueue()
+        self.uploader = uploader
+
+    def upload_attempt(self, artifact):
+        self.queue.put(artifact)
+
+    def run_task(self):
+        while not self.need_exit():
+            try:
+                artifact = self.queue.get(timeout=self.CADENCE)
+            except queue.Empty:
+                continue
+
+            try:
+                self.uploader.try_upload()  # make sure uploader is sync
+            except Exception:
+                self.logger.exception('when processing queued %r', artifact)
+                continue            
+
+            self.upload_complete(self, artifact)
+
+
+if __name__ == '__main__':
+    archive_zip('src', '.bash')
