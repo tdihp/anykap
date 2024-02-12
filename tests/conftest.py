@@ -12,9 +12,9 @@ def logconf(caplog):
     caplog.set_level(logging.DEBUG)
 
 
-@pytest_asyncio.fixture
-async def hq(tmp_path):
-    return HQ(datapath=tmp_path / 'hq')
+@pytest.fixture
+def hq(tmp_path, event_loop):
+    return HQ(datapath=tmp_path / 'hq', loop=event_loop)
     # yield hq
     # await asyncio.wait_for(hqtask, timeout=5)  # 5 secs should be enough
 
@@ -27,13 +27,14 @@ async def hqtask(hq):
     await asyncio.wait_for(hqtask, timeout=5)
 
 
-# @pytest.fixture
-# def hqthread(hq):
-#     hqthread = threading.Thread(target=hq.run)
-#     yield hqthread
-#     if hq.running:
-#         hq.running = False
-#         # we expect hqthread can be joined reasonably fast
-#         hqthread.join(timeout=5)
-
-#     assert not hqthread.is_alive()
+@pytest.fixture
+def hqthread(hq, event_loop):
+    """this one is for sync tests"""
+    hqthread = threading.Thread(target=event_loop.run_until_complete, args=[hq.run()])
+    # hqthread.start()
+    # test should call hqthread.start(), as add_task is not thread safe
+    yield hqthread
+    # hq.quit.set_result(True)
+    event_loop.call_soon_threadsafe(hq.quit.set_result, True)
+    hqthread.join(3)
+    assert not hqthread.is_alive()

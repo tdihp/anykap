@@ -12,6 +12,7 @@ import contextlib
 import platform
 import shutil
 import time
+import shlex
 import logging
 
 logger = logging.getLogger('anykap')
@@ -273,6 +274,18 @@ class Task(object):
         if self.task:
             return not (self.task.done() or self.task.cancelled())
 
+    def __hash__(self):
+        return hash(self.name)  # Task names should be unique
+
+    def __eq__(self, other):
+        if not isinstance(other, Task):
+            raise ValueError(f'task comparing with nontask {other!r}')
+        return self.name == other.name
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}(name={self.name})'
+
+
 class HQ(object):
     """
     A one for all manager for Tasks, Rules, Artifacts
@@ -282,7 +295,8 @@ class HQ(object):
     """
     def __init__(self, name=None, datapath=None, loop=None):
         """by default we use cwd as datapath"""
-        self.tasks = []  # XXX: should be dict for uniqueness?
+        # self.tasks = set()
+        self.tasks = []
         self.done_tasks = []  # to accelerate
         self.rules = []
         datapath = datapath or os.environ.get('ANYKAP_PATH', os.getcwd())
@@ -365,6 +379,12 @@ class HQ(object):
         # assert task.hq == self
         # task.receptors['exit'].add_filter()
         self.logger.debug('add task %r', task)
+        if not isinstance(task, Task):
+            raise ValueError(f'expecting task, got {task!r}') 
+        if task in self.tasks:
+            raise RuntimeError(f'task {task!r} already in hq, maybe name dup?')
+
+        # self.tasks.add(task)
         self.tasks.append(task)
         if self.running:
             task.start(self)
@@ -420,7 +440,7 @@ class ShellTask(Task):
     STDOUT_FILE = 'sh.stdout'
     STDERR_FILE = 'sh.stderr'
     RESULT_FILE = 'sh.result'
-    SIGTERM_TIMEOUT = 5
+    # SIGTERM_TIMEOUT = 5
     SIGKILL_TIMEOUT = 1
     CADENCE = 0.2
 
@@ -438,6 +458,7 @@ class ShellTask(Task):
                  stderr_mode:Literal['artifact','notify','null','stdout']='artifact',
                  stdout_filter:Optional[Union[str,re.Pattern[str]]]=None,
                  stderr_filter:Optional[Union[str,re.Pattern[str]]]=None,
+                 terminate_timeout=5,
                  **kwargs,
                  ):
         super().__init__(name)
@@ -451,6 +472,7 @@ class ShellTask(Task):
         self.errors = errors
         self.stdout_mode = stdout_mode
         self.stderr_mode = stderr_mode
+        self.terminate_timeout = terminate_timeout
 
         if stdout_filter:
             if isinstance(stdout_filter, str):
@@ -574,7 +596,7 @@ class ShellTask(Task):
     async def cancel_process(self, p):
         p.terminate()
         try:
-            await asyncio.wait_for(p.wait(), timeout=self.SIGTERM_TIMEOUT)
+            await asyncio.wait_for(p.wait(), timeout=self.terminate_timeout)
             return
         except asyncio.TimeoutError:
             self.logger.warning('terminating process timed out')
@@ -585,3 +607,213 @@ class ShellTask(Task):
             return
         except asyncio.TimeoutError:
             self.logger.error('killing process timed out, giving up')
+
+
+class REPLServerProtocol(asyncio.Protocol):
+    r"""A way user can interact with HQ for some simple actions
+    It is also a "task" because why not?
+
+    Protocol:
+        request:
+            always single line ends with os.linesep with pattern:
+                <cmd> [<param1> <param2> ...]
+            Both cmd and param goes through shlex, so they can be quoted.
+            exit/quit is a protocol level command that causes the server to
+            directly hang up without sending a response.
+        response:
+            starts with a status line of OK/ERR, several content lines, ends
+            with a empty line:
+                <STATUS>
+                <non-empty-data>
+                <non-empty-data>
+                ...
+                <empty new line>
+            For ERR, the following lines will show error specific data,
+            Server will disconnect after sending the full ERR message.
+            for OK, meaningful content.
+        Noting that newline is the only control charater that should always be
+        honored. (Yes this is a limited protocol, not for binary/arbitary
+        transfer)
+
+    User can use `nc -CU <file>` to access the unix socket for plain text
+    interaction.
+    """
+    def __init__(self, server,
+                 newline=b'\r\n', idle_timeout=300, max_request=1024):
+        self.newline = newline
+        self.idle_timeout = idle_timeout
+        self.max_request = max_request
+        self.server = server
+        self.logger = logger.getChild(self.__class__.__name__)
+        self.logger.debug('protocol created')
+
+    def on_timeout(self, progress):
+        logger.debug('progress timing out: %d, current progress: %d',
+                     progress, self.progress)
+        if self.progress > progress: 
+            return  # client made progress, not timeout
+        else:
+            return self.fail('session timed out')
+
+    def on_progress(self):
+        self.progress += 1
+        loop = asyncio.get_running_loop()
+        logger.debug('call_later(%s,%s,%s)', self.idle_timeout, self.on_timeout, self.progress)
+        # asyncio.call_later(self.idle_timeout, self.on_timeout, self.progress)
+        loop.call_later(self.idle_timeout, self.on_timeout, self.progress)
+
+    def listening(self):
+        self.buffer = bytearray()
+        self.state = 'LISTEN'
+        self.on_progress()
+
+    def connection_made(self, transport):
+        self.transport = transport
+        self.logger.info('new connection')
+        self.progress = 0
+        self.listening()
+
+    def data_received(self, data):
+        self.logger.debug('received data %r', data)
+        self.on_progress()
+        if self.state != 'LISTEN':
+            return self.fail('received data when in state %s',  self.state)
+
+        buffer = self.buffer
+        buffer.extend(data)
+        if len(buffer) > self.max_request:
+            return self.fail('input too large (%d)', len(buffer))
+
+        if not buffer.endswith(self.newline):
+            return
+
+        self.state = "PROCESS"
+        if buffer.count(self.newline) > 1:
+            return self.fail('request has multiple newlines')
+
+        try:
+            query = buffer.decode('ascii')
+        except Exception as e:  # yup we only support ascii
+            return self.fail('request cannot be decoded with ascii, %s', str(e))
+
+        try:
+            cmdline = shlex.split(query)
+            if not cmdline:
+                return self.fail('no command found')
+
+            if cmdline[0] in {'exit', 'quit'}:
+                self.transport.close()
+                return
+
+            response = self.server.call_cmd(*cmdline)
+        except Exception as e:
+            logger.exception('got exception when calling cmd')
+            self.transport.write(b'ERR' + self.newline)
+            self.transport.write(self.sanitize(repr(e)) + self.newline * 2)
+            self.transport.close()
+            return
+
+        self.transport.write(b'OK' + self.newline)
+        for row in response:
+            self.transport.write(self.sanitize(row) + self.newline)
+
+        self.transport.write(self.newline)
+        self.listening()
+
+    def sanitize(self, data):
+        """we make sure there's no empty new lines in data"""
+        return re.sub(
+            br'(%s)+' % re.escape(self.newline), self.newline,
+            data.encode('ascii', errors='replace').strip(self.newline))
+
+    def fail(self, reason, *args):
+        self.logger.info('connection failed: ' + reason, *args)
+        self.transport.close()
+
+
+class REPLServer(Task):
+    def __init__(self, path, name='replserver', **kwargs):
+        """
+        path is relative to hq.path
+        """
+        super().__init__(name=name)
+        self.path = path
+        self.kwargs = kwargs  # for protocol factory
+
+    async def run_task(self, hq):
+        # logging.basicConfig(level=logging.DEBUG)
+        server = await asyncio.get_running_loop().create_unix_server(
+            lambda: REPLServerProtocol(self, **self.kwargs),
+            hq.datapath / self.path)
+        logger.info('server started')
+        async with server:
+            await self.wait_exit()
+
+    def call_cmd(self, cmd, *args):
+        cmdfunc = self.commands[cmd]  # fine to raise KeyError
+        return cmdfunc(*args)
+
+
+class HQREPLServer(REPLServer):
+    HELP = '''
+    Commands available:
+        h/help [<command>] - prints help
+        tasks - list all tasks
+        artifacts - list all artifacts
+        stop-tasks <pattern> - stop task(s) of the given pattern.
+                              prints tasks issued stop
+        send-event <event-json>
+    '''
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.commands = {
+            'h': self.cmd_help,
+            'help': self.cmd_help,
+            'tasks': self.cmd_tasks,
+            'stop-tasks': self.cmd_stop_tasks,
+        }
+
+    async def run_task(self, hq):
+        self.hq = hq
+        return await super().run_task(hq)
+
+    def cmd_help(self, cmd=None):
+        ''' Prints help
+        '''
+        return [self.HELP.strip()]
+
+    def cmd_tasks(self):
+        """
+        """
+        result = ['\t'.join(['name', 'running', 'stopping'])]
+        for task in list(self.hq.tasks):
+            running = task.is_alive()
+            stopping = False
+            if running:
+                stopping = task.need_exit()
+            result.append('\t'.join([task.name, str(running), str(stopping)]))
+
+        return result
+
+    def cmd_stop_tasks(self, pattern):
+        """
+        input:
+            task_query: regular expression for task name
+        output:
+            task_name (for every task with stop sent)
+            ...
+        """
+        compiled = re.compile(pattern)
+        result = []
+        for task in self.hq.tasks:
+            if not compiled.search(task.name):
+                continue
+            
+            if task.is_alive and not task.need_exit():
+                task.exit()
+                result.append(task.name)
+        return result
+
+
+
+

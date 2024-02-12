@@ -1,4 +1,5 @@
 from anykap import *
+import signal
 import pytest
 
 
@@ -79,3 +80,41 @@ async def test_shelltask_notify(hq, hqtask):
     await regexnotify.join()
     assert q.empty()
     assert set(e['groupdict']['num'] for e in shellresult) == myresult
+
+
+async def test_shelltask_timeout(hq, hqtask):
+    q = queue.Queue()
+
+    def myrule(event):
+        if event.get('kind') == 'shell' and event.get('topic') == 'complete':
+            q.put_nowait(event)
+
+    hq.add_rule(myrule)
+    sleepforever = ShellTask(
+        'sleep-forever',
+        r'''
+        sleep infinity
+        ''',
+        timeout=1
+    )
+    hq.add_task(sleepforever)
+    result = await asyncio.wait_for(q.get(), timeout=2)  # generously give 2s
+    q.task_done()
+    assert result['status'] == -signal.SIGTERM and result['task_name'] == 'sleep-forever'
+    await sleepforever.join()
+    assert q.empty()
+
+    sleepblocksigterm = ShellTask(
+        'sleep-block-sigterm',
+        r'''
+        trap "" SIGTERM
+        sleep infinity
+        ''',
+        timeout=1,
+        terminate_timeout=1,
+    )
+    hq.add_task(sleepblocksigterm)
+    result = await asyncio.wait_for(q.get(), timeout=3)
+    q.task_done()
+    assert result['status'] == -signal.SIGKILL and result['task_name'] == 'sleep-block-sigterm'
+    await sleepblocksigterm.join()
