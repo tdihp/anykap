@@ -1,33 +1,30 @@
 from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal
-import threading
-import queue
-import subprocess
-import time
-import datetime
-from pathlib import Path
-from shutil import rmtree
-import json
-import logging
-import itertools as it
-import contextlib
-import shutil
 import os
-import re
-import shlex
+from pathlib import Path
+import itertools as it
 import asyncio
-import selectors
-import tempfile
-import io
-import math
+import asyncio.queues as queue
+import asyncio.subprocess as subprocess
+import datetime
+import re
+import contextlib
+import platform
+import shutil
+import time
+import logging
 
 logger = logging.getLogger('anykap')
 
 
+
+# ------------------------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------------------------
+
 NAME_PARSER = re.compile('^[a-z][a-z0-9_-]{0,254}$', flags=re.ASCII)
 
-
-def valicate_name(name:str):
+def validate_name(name:str):
     """
     a general name parser for all named components
     basically:
@@ -46,110 +43,9 @@ def sanitize_name(name:str):
                   re.sub(r'\s+', '_', name.strip().lower())).strip('_-')[:255]
 
 
-class HQ(object):
-    """
-    rules: a list of functions to react on events. Rules can be added,
-           not removed
-    tasks: a list of Task objects
-    """
-    CADENCE = 0.1
-    def __init__(self, datapath=None):
-        """by default we use cwd as datapath"""
-        self.tasks = []
-        self.rules = []
-        datapath = datapath or os.environ.get('ANYKAP_PATH', os.getcwd())
-        self.datapath = Path(datapath).absolute()
-        self.datapath.mkdir(parents=True, exist_ok=True)
-        self.running = False
-        self._lock = threading.RLock()
-        self.queue = queue.SimpleQueue()
-        self.artifact_counter = it.count()
-        self.artifacts = set()
-        self.logger = logger.getChild('HQ')
-
-    def run(self):
-        with self._lock:
-            assert not self.running
-            self.running = True
-            for task in self.tasks:
-                self.logger.debug('starting task %s', task)
-                task.start()
-
-        while self.running:
-            self.logger.debug('running loop')
-            self.event_loop()
-
-    def event_loop(self):
-        """execute event processing logic for one loop"""
-        # we block only the the first one
-        get_args = {'block': True, 'timeout': self.CADENCE}  
-        logger = self.logger
-        while True:
-            try:
-                item = self.queue.get(**get_args)
-                logger.debug('got item %s', item)
-            except queue.Empty:
-                break
-
-            for task in self.tasks:
-                for f in task.receptors.values():
-                    try:
-                        f(item)
-                    except Exception:
-                        logger.exception(
-                            'failed when calling receptor for task %s on item %r',
-                            task, item)
-
-            for f in self.rules:
-                try:
-                    f(item)
-                except Exception:
-                    logger.exception(
-                        'failed when calling rule %r on item %r', f, item
-                    )
-
-            get_args = {'block': False}
-
-    def add_task(self, task):
-        """ add a new task to hq
-        """
-        # we are assuming tasks are not yet running.
-        with self._lock:
-            task.hq = self
-            # assert task.hq == self
-            # task.receptors['exit'].add_filter()
-            self.tasks.append(task)
-            if self.running:
-                task.start()
-
-    def add_rule(self, rule):
-        self.rules.append(rule)
-
-    def send_event(self, event:dict):
-        """tasks should call this to transmit new events"""
-        self.queue.put(event)
-
-    def new_artifact(self, name, keep=True, context=None):
-        artifact_name = self.gen_artifact_name(name)
-        path = self.datapath / name
-        if path.exists():
-            raise RuntimeError('artifact path %s already exists' % path)
-
-        path.mkdir(parents=True)
-        artifact = Artifact(artifact_name, path, keep)
-        with self._lock:
-            self.artifacts.add(artifact)
-        artifact.hq = self
-        return artifact
-
-    def gen_artifact_name(self, name):
-        now = datetime.datetime.utcnow().strftime('%Y%m%d%H%M')
-        cnt = next(self.artifact_counter)
-        return f'{now}-{name}-{cnt}'
-
-    def forget_artifact(self, artifact):
-        with self._lock:
-            self.artifacts.discard(artifact)
+# -------------
+# Core Concepts
+# -------------
 
 class Receptor(object):
     """
@@ -163,20 +59,24 @@ class Receptor(object):
         self.logger = logger.getChild(self.__class__.__name__)
 
     def add_condition(self,
-                      filter:Callable[["dict"], bool],
+                      filter_:Callable[["dict"], bool],
                       mutator:Optional[Callable[["dict"], Any]]=None,
                       ):
-        self.conditions.append((filter, mutator))
+        if not callable(filter_):
+            raise ValueError(f'provided filter {filter_!r} not callable')
+        if mutator and not callable(mutator):
+            raise ValueError(f'provided mutator {mutator!r} not callable')
+        self.conditions.append((filter_, mutator))
 
     def __call__(self, event:dict):
-        for filter, mutator in self.conditions:
+        for filter_, mutator in self.conditions:
             try:
-                if not filter(event):
+                if not filter_(event):
                     return
             except Exception:
                 self.logger.exception(
                     'failed when calling filter %r on event %r',
-                    filter, event)
+                    filter_, event)
                 return
 
             mutation_result = event
@@ -193,354 +93,111 @@ class Receptor(object):
             break  # first match wins
 
     def send(self, event:Any):
+        # send should never block
         raise NotImplementedError
 
-    def get(self, timeout=None):
+    def get_nowait(self):
         """get everything of the receptor"""
         raise NotImplementedError
+
+    async def get(self, timeout=None):
+        """returns None if times out"""
+        return self.get_nowait()
+
+class FutureReceptor(Receptor):
+    """ a future -> value receptor, only wait once, typical for exit receptor """
+    def __init__(self, initial_value=False):
+        super().__init__()
+        self.future = asyncio.Future()
+        self.value = initial_value
+    
+    def send(self, event):
+        # unconditionally mark future done
+        if self.future.done():
+            return
+
+        self.value = event
+        self.future.set_result(None)
+
+    def get_nowait(self):
+        return self.value
+
+    async def get(self, ):
+        # done, pending = await asyncio.wait([self.future], timeout=timeout)
+        # regardless of timeout or not, we return the value.
+        await self.future
+        return self.value
 
 
 class QueueReceptor(Receptor):
     def __init__(self):
         super().__init__()
-        self.queue = queue.SimpleQueue()
+        self.queue = queue.Queue()
 
     def send(self, event):
-        self.queue.put(event)
+        self.queue.put_nowait(event)
 
-    def get(self, timeout=None):
+    def get_nowait(self):
         """get one item from queue with optional timeout. Return None if
         nothing available.
         """
-        if timeout is None:
-            kwargs = {'block': False}
-        else:
-            kwargs = {'block': True, 'timeout': timeout}
-        
         try:
-            return self.queue.get(**kwargs)
-        except queue.Empty:
+            event = self.queue.get_nowait()
+        except queue.QueueEmpty:
             return None
+        self.queue.task_done()
+        return event
 
-
-class TEventReceptor(Receptor):
-    def __init__(self):
-        super().__init__()
-        self.event = threading.Event()
-
-    def send(self, event):
-        if bool(event):
-            self.event.set()
-        else:
-            self.event.clear()
-
-    def get(self, timeout=None):
-        if timeout is None:
-            return self.event.is_set()
-
-        return self.event.wait(timeout=timeout)
-
-
-class Task(threading.Thread):
-    # each task can have fixed number of receptors. They should be defined like
-    # this:
-    # Noting a exit receptor always exists and HQ expects that
-    receptors:dict[str, Receptor]
-
-    # The exit receptor should be checked by run function to check whether to
-    # terminate itself immediately
-    receptor_exit = TEventReceptor
-
-    def __init__(self, name:str):
-        super().__init__(name=name)
-        if not valicate_name(name):
-            raise ValueError(
-                f"given name {name} is not valid, please sanitize first")
-        self.name = name
-        self.receptors = dict((k.split('_', 1)[1], getattr(self, k)())
-                              for k in dir(self)
-                              if k.startswith('receptor_'))
-        # XXX: we are assuming name is unique
-        self.logger = logger.getChild(self.__class__.__name__).getChild(self.name)
-        self.local = threading.local()
-
-    def exit(self):
-        """intended method to directly terminate this task"""
-        self.receptors['exit'].send(1)
-
-    def need_exit(self):
-        """should be tested in run"""
-        return self.receptors['exit'].get()
-
-    def send_event(self, event):
-        self.hq.send_event(event)
-
-    def run(self):
-        self.local.logger = self.logger.getChild(str(threading.get_native_id()))
-        try:
-            self.run_task()
-        except BaseException:
-            self.logger.exception('task encountered error')
-        finally:
-            pass
-
-    def run_task(self):
-        """tasks should implement this"""
-        raise NotImplementedError
-
-    def new_artifact(self, name=None, keep=True):
-        return self.hq.new_artifact(name or self.name, keep)
-
-
-class Compressor(object):
-    """"""
-    pass
-
-
-class CRICtlData(object):
-    OBJTYPE:str
-    LIST_KEY:str
-    INSPECT_KEY:str
-    DATA_LIST_KEY:str
-    RUN_TIMEOUT:int = 3
-    DATA_KEYS:set[str] = set()
-    INSPECT_KEYS:set[str] = set()
-
-    @classmethod
-    def list(cls, **kwargs):
-        cp = subprocess.run(['crictl', cls.LIST_KEY, '-o', 'json']
-                            + cls.query_args(**kwargs),
-                            stdout=subprocess.PIPE, text=True, check=True,
-                            timeout=cls.RUN_TIMEOUT)
-        data = json.loads(cp.stdout)
-        return [cls(item) for item in data[cls.DATA_LIST_KEY]]
-
-    @classmethod
-    def query_args(cls, **kwargs):
-        return []
-
-    def __init__(self, data, inspect=None):
-        self._data = data
-        self._inspect = inspect
-
-    @property
-    def inspect(self):
-        # lazily inspect things
-        if self._inspect is None:
-            self._inspect = self.run_inspect()
-
-        return self._inspect
-
-    def __hash__(self):
-        return self.id
-
-    def run_inspect(self):
-        cp = subprocess.run(['crictl', self.INSPECT_KEY, self.id, '-o', 'json'],
-                            stdout=subprocess.PIPE, text=True, check=True,
-                            timeout=self.RUN_TIMEOUT)
-        return json.loads(cp.stdout)
-
-    def __getattr__(self, name):
-        if name in self.DATA_KEYS:
-            return self._data[name]
-
-        if name in self.INSPECT_KEYS:
-            return self.inspect[name]
-
-        raise AttributeError("attribute %s is not known" % name)
-
-
-class CRIPodSandbox(CRICtlData):
-    OBJTYPE = 'pod'
-    LIST_KEY = 'pods'
-    INSPECT_KEY = 'inspectp'
-    DATA_LIST_KEY = 'items'
-    DATA_KEYS = {
-        'id',
-        'metadata',
-        'state',
-        'createdAt',
-        'labels',
-        'annotations',
-        'runtimeHandler',
-    }
-    INSPECT_KEYS = {
-        'status',
-        'info',
-    }
-
-    @classmethod
-    def query_args(cls, namespace=None, name=None, labels=None):
-        args = []
-        if namespace:
-            args += ['--namespace', namespace]
-
-        if name:
-            args += ['--name', name]
-        
-        if labels:
-            for label in labels:
-                args += ['--label', label]
-
-        return args
-
-
-class CRIContainer(CRICtlData):
-    OBJTYPE = 'container'
-    LIST_KEY = 'ps'
-    INSPECT_KEY = 'inspect'
-    DATA_LIST_KEY = 'containers'
-    POD_NAME_LABEL = "io.kubernetes.pod.name"
-    POD_NAMESPACE_LABEL = "io.kubernetes.pod.namespace"
-    POD_UID_LABEL = "io.kubernetes.pod.uid"
-    DATA_KEYS = {
-        'id',
-        'podSandboxId',
-        'metadata',
-        'image',
-        'imageRef',
-        'state',
-        'createdAt',
-        'labels',
-        'annotations',
-    }
-    INSPECT_KEYS = {
-        'status',
-        'info',
-    }
-
-
-    @classmethod
-    def query_args(cls, name=None, image=None, labels=None,
-                 pod_name=None, pod_namespace=None, pod_uid=None):
-        args = []
-
-        if name:
-            args += ['--name', name]
-
-        if image:
-            args += ['--image', image]
-
-        labels = list(labels) if labels else []
-
-        if pod_name:
-            labels.append(cls.POD_NAME_LABEL + '=' + pod_name)
-
-        if pod_namespace:
-            labels.append(cls.POD_NAMESPACE_LABEL + '=' + pod_namespace)
-
-        if pod_uid:
-            labels.append(cls.POD_UID_LABEL + '=' + pod_uid)
-
-        for label in labels:
-            args += ['--label', label]
-
-        return args
-
-
-class CRIImage(CRICtlData):
-    OBJTYPE = 'image'
-    LIST_KEY = 'img'
-    INSPECT_KEY = 'inspecti'
-    DATA_LIST_KEY = 'images'
-    DATA_KEYS = {
-        'id',
-        'repoTags',
-        'repoDigests',
-        'size',
-        'uid',
-        'username',
-        'spec',
-        'pinned',
-    }
-    INSPECT_KEYS = {
-        'status',
-        'info',
-    }
+    async def get(self):
+        return self.queue.get()
 
 
 class Artifact(object):
-    """
-    Claims a path for saving data. Task shouldn't write any data to disk without
-    requesting an Artifact.
-
-    HQ tracks artifact's progress so data can be presented and/or uploaded.
-    Artifact is strictly speaking not bound to Tasks, while in reality it should
-    be.
-
-    regular use case:
-
-        with hq.new_artifact(self, 'name') as artifact:
-            (artifact.path / 'out.file').write('hello')
-    
-    """
-    
+    """metadata for artifact"""
+    hq:"HQ" = None
     def __init__(self, name:str, path:Path, keep=True, context:Any=None):
         """keep is a hint on whether we intend to keep it.
         Some commands might just need a working dir for artifact.
         """
         self.name = name
         self.path = path
-        self.hq = None
-        self._state = 'created'
-        self._start_time = None
-        self._completion_time = None
         self.loggers = []
         self.handler = None
-        self.lock = threading.RLock()
         self.keep = True
         self.context = context
-        self.upload_state = None  # None / 'uploading' / complete
+        self.upload_state = None  # None / 'uploading' / 'complete'
         self.upload_attempts = 0
         self.last_upload_failure = None
+        self.upload_url = None # a path metadata for human comsumption
+        self.milestones = {}
+        self.mark_state('created')
+
+    def mark_state(self, state):
+        self.state = state
+        self.milestones[state] = datetime.datetime.utcnow()
 
     def start(self):
-        with self.lock:
-            assert self._state == 'created'
-            self._state = 'started'
-            self._start_time = datetime.datetime.utcnow()
+        assert self.state == 'created'
+        self.mark_state('started')
 
-            for logger in self.loggers:
-                logger.addHandler(self.handler)
+        for logger in self.loggers:
+            logger.addHandler(self.handler)
 
     def complete(self):
-        with self.lock:
-            assert self._state == 'started', "got state %s" % self._state
-            self._state = 'completed'
-            self._completion_time = datetime.datetime.utcnow()
-            for logger in self.loggers:
-                logger.removeHandler(self.handler)
+        assert self.state == 'started', "got state %s" % self.state
+        self.mark_state('completed')
+        for logger in self.loggers:
+            logger.removeHandler(self.handler)
 
         self.hq.send_event({'kind': 'artifact',
                             'topic': 'complete',
-                            'artifact': self})
+                            'artifact': self})  # for user to find context
         # we don't handle keep here, but other components might decide on how
         # to deal with it
 
     def destroy(self):
-        with self.lock:
-            assert self._state == 'completed'
-            shutil.rmtree(self.path)
-
-    @property
-    def state(self):
-        with self.lock:
-            return self._state
-
-    @property
-    def start_time(self):
-        with self.lock:
-            return self._start_time
-
-    @property
-    def completion_time(self):
-        with self.lock:
-            return self._completion_time
-
-    def handle_logger(self, logger:logging.Logger):
-        with self.lock:
-            if not self.handler:
-                self.handler = logging.FileHandler(self.path / 'anykap.log')
+        assert self.state == 'completed'
+        shutil.rmtree(self.path)
 
     def __enter__(self):
         self.start()
@@ -549,6 +206,201 @@ class Artifact(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.complete()
 
+
+class Task(object):
+    # each task can have fixed number of receptors. They should be defined like
+    # this:
+    # Noting a exit receptor always exists and HQ expects that
+    receptors:dict[str, Receptor]
+
+    # The exit receptor should be checked by run function to check whether to
+    # terminate itself immediately
+    receptor_exit = FutureReceptor
+
+    def __init__(self, name:str):
+        if not validate_name(name):
+            raise ValueError(
+                f"given name {name} is not valid, please sanitize first")
+        self.name = name
+        # every attr with prefix "receptor_" will be taken as a receptor
+        self.receptors = dict((k.split('_', 1)[1], getattr(self, k)())
+                              for k in dir(self)
+                              if k.startswith('receptor_'))
+        # XXX: we are assuming name is unique
+        self.logger = logger.getChild(
+            self.__class__.__name__).getChild(self.name)
+        self.task = None
+
+    def exit(self):
+        """intended method to directly terminate this task"""
+        self.receptors['exit'].send(True)
+
+    def need_exit(self):
+        """should be tested in run"""
+        return self.receptors['exit'].get_nowait()
+
+    async def wait_exit(self):
+        try:
+            return await self.receptors['exit'].get()
+        except asyncio.CancelledError:
+            return
+
+    async def run(self, hq):
+        try:
+            await self.run_task(hq)
+        except Exception:
+            self.logger.exception('task encountered error')
+
+    async def run_task(self, hq):
+        raise NotImplementedError
+
+    def send_event(self, hq, event):
+        return hq.send_event(event)
+
+    def new_artifact(self, hq, name=None, keep=True):
+        return hq.new_artifact(name or self.name, keep) 
+
+    def start(self, hq):
+        # copying from threading.Thread
+        self.task = asyncio.create_task(self.run(hq), name=self.name)
+
+    async def join(self):
+        # only call this after start
+        if self.task:
+            await self.task
+
+    def is_alive(self):
+        if self.task:
+            return not (self.task.done() or self.task.cancelled())
+
+class HQ(object):
+    """
+    A one for all manager for Tasks, Rules, Artifacts
+    rules: a list of functions to react on events. Rules can be added,
+           not removed
+    tasks: a list of Task objects
+    """
+    def __init__(self, name=None, datapath=None, loop=None):
+        """by default we use cwd as datapath"""
+        self.tasks = []  # XXX: should be dict for uniqueness?
+        self.done_tasks = []  # to accelerate
+        self.rules = []
+        datapath = datapath or os.environ.get('ANYKAP_PATH', os.getcwd())
+        self.datapath = Path(datapath).absolute()
+        self.datapath.mkdir(parents=True, exist_ok=True)
+        self.running = False
+        self.quit = asyncio.Future(loop=loop) # external trigger for test
+        self.queue = queue.Queue()
+        self.artifact_counter = it.count()
+        self.artifacts = []
+        self.name = name or sanitize_name(platform.node())
+        self.logger = logger.getChild('HQ')
+
+    async def run(self):
+        assert not self.running
+        self.running = True
+        for task in self.tasks:
+            self.logger.debug('starting task %s', task)
+            task.start(self)
+
+        looptask = asyncio.create_task(self.loop())
+        await self.quit
+        waits = []
+        for task in self.tasks:
+            if task.is_alive():
+                task.exit()
+                waits.append(task)
+        asyncio.gather(*waits)
+        self.running = False
+        await self.queue.join()
+        looptask.cancel()
+        try:
+            await looptask
+        except asyncio.CancelledError:
+            pass
+
+    async def loop(self):
+        """execute event processing logic for one loop"""
+        # we block only the the first one
+        # get_args = {'block': True, 'timeout': self.CADENCE}  
+        logger = self.logger
+        while self.running:
+            try:
+                event = await self.queue.get()
+            except asyncio.CancelledError:
+                logger.debug('loop canceled')
+                if self.queue.qsize:
+                    logger.warning('loop canceled when items in queue')
+                raise
+            self.queue.task_done()
+            logger.debug('got event %s', event)
+            self.process_event(event)
+
+    def process_event(self, event):
+        for task in self.tasks:
+            if not task.is_alive():
+                self.tasks.remove(task)
+                self.done_tasks.append(task)
+                continue
+
+            for f in task.receptors.values():
+                try:
+                    f(event)
+                except Exception:
+                    logger.exception(
+                        'failed when calling receptor for task %s on event %r',
+                        task, event)
+
+        for f in self.rules:
+            try:
+                f(event)
+            except Exception:
+                logger.exception(
+                    'failed when calling rule %r on item %r', f, event)
+
+    def add_task(self, task):
+        """ add a new task to hq
+        """
+        # we are assuming tasks are not yet running.
+        # assert task.hq == self
+        # task.receptors['exit'].add_filter()
+        self.logger.debug('add task %r', task)
+        self.tasks.append(task)
+        if self.running:
+            task.start(self)
+
+    def add_rule(self, rule):
+        self.rules.append(rule)
+
+    def send_event(self, event:dict):
+        """tasks should call this to transmit new events"""
+        self.queue.put_nowait(event)
+
+    def new_artifact(self, name, keep=True, context=None):
+        artifact_name = self.gen_artifact_name(name)
+        path = self.datapath / name
+        if path.exists():
+            raise RuntimeError('artifact path %s already exists' % path)
+
+        path.mkdir(parents=True)
+        artifact = Artifact(artifact_name, path, keep)
+        self.artifacts.append(artifact)
+        artifact.hq = self
+        return artifact
+
+    def gen_artifact_name(self, name):
+        now = datetime.datetime.utcnow().strftime('%Y%m%d%H%M')
+        cnt = next(self.artifact_counter)
+        node_name = self.name
+        return f'{now}-{node_name}-{name}-{cnt}'
+
+    def forget_artifact(self, artifact):
+        self.artifacts.remove(artifact)
+
+
+# ------------------------------------------------------------------------------
+# Scenarios
+# ------------------------------------------------------------------------------
 
 class ShellTask(Task):
     """run shell scripts
@@ -568,8 +420,8 @@ class ShellTask(Task):
     STDOUT_FILE = 'sh.stdout'
     STDERR_FILE = 'sh.stderr'
     RESULT_FILE = 'sh.result'
-    SIGTERM_TIMEOUT = 10
-    SIGKILL_TIMEOUT = 3
+    SIGTERM_TIMEOUT = 5
+    SIGKILL_TIMEOUT = 1
     CADENCE = 0.2
 
     def __init__(self,
@@ -617,8 +469,8 @@ class ShellTask(Task):
                                  % stderr_filter)
         self.stderr_filter = stderr_filter
 
-    def run_task(self):
-        logger = self.local.logger
+    async def run_task(self, hq):
+        logger = self.logger
         args = [self.shell]
         if self.shell_args:
             args.extend(self.shell_args)
@@ -628,12 +480,10 @@ class ShellTask(Task):
         if self.nsenter_args:
             args[0:0] = ['nsenter'] + self.nsenter_args
 
-        start_time = time.monotonic()
-
         # by default, we simply write to artifact directory
-        with contextlib.ExitStack() as stack:
+        async with contextlib.AsyncExitStack() as stack:
             artifact = stack.enter_context(
-                self.new_artifact(keep=self.keep_artifact))
+                self.new_artifact(hq, keep=self.keep_artifact))
 
             def prepare_file(mode, filename):
                 if mode == 'artifact':
@@ -646,623 +496,92 @@ class ShellTask(Task):
                     return subprocess.STDOUT
                 elif mode == 'notify':
                     return subprocess.PIPE
-                raise ValueError('unrecognized')
+                raise ValueError(f'unrecognized mode {mode!r}')
 
             stdout = prepare_file(self.stdout_mode, self.STDOUT_FILE)
             stderr = prepare_file(self.stderr_mode, self.STDERR_FILE)
-            p = subprocess.Popen(
-                args, cwd=str(artifact.path),
-                encoding=self.encoding, errors=self.errors,
+            p = await subprocess.create_subprocess_exec(
+                *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
             )
-            selector = selectors.DefaultSelector()
+            notify_tasks = []
             if self.stdout_mode == 'notify':
-                selector.register(p.stdout.fileno(),
-                                  selectors.EVENT_READ,
-                                  (p.stdout, self.stdout_filter, 'stdout'))
+                notify_tasks.append(asyncio.create_task(self.notify_output(
+                    hq, p.stdout, self.stdout_filter, 'stdout'
+                )))
             if self.stderr_mode == 'notify':
-                selector.register(p.stderr.fileno(),
-                                  selectors.EVENT_READ,
-                                  (p.stderr, self.stderr_filter, 'stderr'))
+                notify_tasks.append(asyncio.create_task(self.notify_output(
+                    hq, p.stderr, self.stderr_filter, 'stderr'
+                )))
 
-            while True:
-                for key, mask in selector.select(self.CADENCE):
-                    f, pattern, name = key.data
-                    for line in f.readlines():
-                        logger.debug('processing line %r', line)
-                        extra = {}
-                        if pattern:
-                            logger.debug('pattern: %r, line: %r', pattern, line)
-                            m = pattern.search(line)
-                            if not m:
-                                continue
-                            extra = {
-                                'groups': m.groups(),
-                                'groupdict': m.groupdict(),
-                            }
-                        event = {
-                            'kind': 'shell',
-                            'topic': 'line',
-                            'output': name,
-                            'line': line,
-                            'task_name': self.name,
-                        }
-                        event.update(extra)
-                        self.send_event(event)
+            wait_exit_task = asyncio.create_task(self.wait_exit())
+            wait_p_task = asyncio.create_task(p.wait())
+            done, pending = await asyncio.wait(
+                [wait_exit_task, wait_p_task],
+                timeout=self.timeout,
+                return_when=asyncio.FIRST_COMPLETED)
 
-                result = p.poll()
+            need_cancel = True
+            if wait_p_task in done:
+                need_cancel = False
+                logger.info('script completed')
+            elif wait_exit_task in done:
+                logger.info('task exited externally')
+            else:
+                logger.info('reached timeout')
 
-                is_timeout = self.timeout and (
-                    time.monotonic() - start_time > self.timeout)
-
-                if result is not None:  # completed
-                    logger.info('script exited with code %d', result)
-                    (artifact.path / self.RESULT_FILE).write_text(str(result))
-                elif self.need_exit() or is_timeout:
-                    if is_timeout:
-                        logger.info('timeout')
-                    if self.need_exit():
-                        logger.info('received exit')
-                    logger.info('terminating')
-                    try:
-                        result = p.wait(self.SIGTERM_TIMEOUT)
-                    except subprocess.TimeoutExpired:
-                        logger.warning('terinating timed out, killing')
-                        p.kill()
-                        try:
-                            result = p.wait(self.SIGKILL_TIMEOUT)
-                        except subprocess.TimeoutExpired:
-                            logger.error('kill timed out. Giving up')
-                            raise
-
-                if result is not None:
-                    logger.info('exit code: %d', result)
-                    self.send_event(
-                        {
-                            'kind': 'shell',
-                            'topic': 'complete',
-                            'status': result,
-                            'task_name': self.name,
-                        })
-                    return
-
-
-class CRIDiscovery(Task):
-    CADENCE = 5
-    def __init__(self, datacls:Type[CRICtlData], name=None, send_list=False,
-                 **query):
-        super().__init__(name=None or datacls.OBJTYPE + '_discovery')
-        self.datacls = datacls
-        self.watching = set()
-        self.send_list = send_list  # send list on cadence if needed
-        self.query = query
-
-    def run_task(self):
-        logger = self.local.logger
-        self.datacls.list()
-        while not self.need_exit():
-            result = set(self.datacls.list(**self.query))
-            added = result - self.watching
-            removed = self.watching - result
-            for obj in added:
-                self.send_event({
-                    'kind': 'discovery',
-                    'topic': 'new',
-                    'objtype': self.datacls.OBJTYPE,
-                    'task': self.name,
-                    'object': obj,
+            if need_cancel:
+                await self.cancel_process(p)
+            # any way, we try to get return code
+            result = p.returncode
+            logger.info(f'script exit code: {result!r}')
+            if notify_tasks:
+                await asyncio.wait(notify_tasks)
+            (artifact.path / self.RESULT_FILE).write_text(str(result))
+            self.send_event(hq, 
+                {
+                    'kind': 'shell',
+                    'topic': 'complete',
+                    'status': result,
+                    'task_name': self.name,
                 })
 
-            for obj in removed:
-                self.send_event({
-                    'kind': 'discovery',
-                    'topic': 'lost',
-                    'objtype': self.datacls.OBJTYPE,
-                    'task': self.name,
-                    'object': obj,
-                })
-            
-            self.watching -= removed
-            self.watching += added
-            if self.send_list:
-                self.send_event({
-                    'kind': 'discovery',
-                    'topic': 'list',
-                    'objtype': self.datacls.OBJTYPE,
-                    'task': self.name,
-                    'object': list(self.watching),
-                })
-            time.sleep(self.CADENCE)
-
-        logger.info('exiting')
-
-
-class PODDiscovery(CRIDiscovery):
-    def __init__(self, name=None, **kwargs):
-        super().__init__(CRIPodSandbox, name=name, **kwargs)
-
-
-class ContainerDiscovery(CRIDiscovery):
-    def __init__(self, name=None, **kwargs):
-        super().__init__(CRIContainer, name=name, **kwargs)
-
-
-class ImageDiscovery(CRIDiscovery):
-    def __init__(self, name=None, **kwargs):
-        super().__init__(CRIImage, name=name, **kwargs)
-
-
-class Fission(object):
-    """
-    templating method for creating & adding new tasks
-    """
-    def __init__(self, hq, task_factory, name=None,
-                 filter=None, mutator=None,
-                 **kwargs):
-        self.hq = hq
-
-        if not filter and not hasattr(self, 'filter'):
-            raise ValueError('filter must be provided')
-
-        if filter:
-            self.filter = filter
-
-        if not mutator and not hasattr(self, 'mutator'):
-            raise ValueError('mutator must be provided')
-    
-        if mutator:
-            self.mutator = mutator
-
-        self.name = name
-        self.task_factory = task_factory
-        self.kwargs = kwargs
-        self.counter = it.count(1)
-        self.logger = logger.getChild(self.__class__.__name__)
-
-    def next_task_name(self):
-        return '-'.join(self.name + next(self.counter))
-
-    def __call__(self, event):
-        try:
-            if not self.filter(event):
-                return
-        except Exception:
-            self.logger.exception(
-                'calling filter %r fails on event %r, ignoring',
-                self.filter, event)
-            return
-
-        try:
-            mutating_result = self.mutator(event)
-        except Exception:
-            self.logger.exception('calling mutator %r fail on event %r, ignoring',
-                self.mutator, event)
-            return
-
-        params = self.kwargs.copy()
-        params.update(mutating_result)
-        if 'name' not in mutating_result:
-            # we make the task name if not supplied
-            params['name'] = self.next_task_name()
-
-        try:
-            new_task = self.task_factory(**params)
-        except Exception:
-            self.logger.exception('calling factory %r fails on event %r',
-                                  self.task_factory, event)
-            return
-
-        if not isinstance(new_task, Task):
-            self.logger.error('factory %r generated non-task %r, ignored',
-                              self.task_factory, new_task)
-            return
-
-        self.hq.add_task(new_task)
-
-
-class REPLServerProtocol(asyncio.Protocol):
-    r"""A way user can interact with HQ for some simple actions
-    It is also a "task" because why not?
-
-    Protocol:
-        request:
-            always single line ends with os.linesep with pattern:
-                <cmd> [<param1> <param2> ...]
-            Both cmd and param goes through shlex, so they can be quoted.
-            exit/quit is a protocol level command that causes the server to
-            directly hang up without sending a response.
-        response:
-            starts with a status line of OK/ERR, several content lines, ends
-            with a empty line:
-                <STATUS>
-                <non-empty-data>
-                <non-empty-data>
-                ...
-                <empty new line>
-            For ERR, the following lines will show error specific data,
-            Server will disconnect after sending the full ERR message.
-            for OK, meaningful content.
-        Noting that newline is the only control charater that should always be
-        honored. (Yes this is a limited protocol, not for binary/arbitary
-        transfer)
-
-    User can use `nc -CU <file>` to access the unix socket for plain text
-    interaction.
-    """
-    def __init__(self, server,
-                 newline=b'\r\n', idle_timeout=300, max_request=1024):
-        self.newline = newline
-        self.idle_timeout = idle_timeout
-        self.max_request = max_request
-        self.server = server
-        self.logger = logger.getChild(self.__class__.__name__)
-        self.logger.debug('protocol created')
-
-
-    def on_timeout(self, progress):
-        logger.debug('progress timing out: %d, current progress: %d',
-                     progress, self.progress)
-        if self.progress > progress: 
-            return  # client made progress, not timeout
-        else:
-            return self.fail('session timed out')
-
-    def on_progress(self):
-        self.progress += 1
-        loop = asyncio.get_running_loop()
-        logger.debug('loop.call_later(%s,%s,%s)', self.idle_timeout, self.on_timeout, self.progress)
-        loop.call_later(self.idle_timeout, self.on_timeout, self.progress)
-
-    def listening(self):
-        self.buffer = bytearray()
-        self.state = 'LISTEN'
-        self.on_progress()
-
-    def connection_made(self, transport):
-        self.transport = transport
-        self.logger.info('new connection')
-        self.progress = 0
-        self.listening()
-
-    def data_received(self, data):
-        self.logger.debug('received data %r', data)
-        self.on_progress()
-        if self.state != 'LISTEN':
-            return self.fail('received data when in state %s',  self.state)
-
-        buffer = self.buffer
-        buffer.extend(data)
-        if len(buffer) > self.max_request:
-            return self.fail('input too large (%d)', len(buffer))
-
-        if not buffer.endswith(self.newline):
-            return
-
-        self.state = "PROCESS"
-        if buffer.count(self.newline) > 1:
-            return self.fail('request has multiple newlines')
-
-        try:
-            query = buffer.decode('ascii')
-        except Exception as e:  # yup we only support ascii
-            return self.fail('request cannot be decoded with ascii, %s', str(e))
-
-        try:
-            cmdline = shlex.split(query)
-            if not cmdline:
-                return self.fail('no command found')
-
-            if cmdline[0] in {'exit', 'quit'}:
-                self.transport.close()
-                return
-
-            response = self.server.call_cmd(*cmdline)
-        except Exception as e:
-            logger.exception('got exception when calling cmd')
-            self.transport.write(b'ERR' + self.newline)
-            self.transport.write(self.sanitize(repr(e)) + self.newline * 2)
-            self.transport.close()
-            return
-
-        self.transport.write(b'OK' + self.newline)
-        for row in response:
-            self.transport.write(self.sanitize(row) + self.newline)
-
-        self.transport.write(self.newline)
-        self.listening()
-
-    def sanitize(self, data):
-        """we make sure there's no empty new lines in data"""
-        return re.sub(
-            br'(%s)+' % re.escape(self.newline), self.newline,
-            data.encode('ascii', errors='replace').strip(self.newline))
-
-    def fail(self, reason, *args):
-        self.logger.info('connection failed: ' + reason, *args)
-        self.transport.close()
-
-
-class REPLServer(Task):
-    CADENCE = 1
-    def __init__(self, path, name='replserver', **kwargs):
-        super().__init__(name=name)
-        self.path = path
-        self.kwargs = kwargs  # for protocol factory
-
-    def run_task(self):
-        logger = self.local.logger
-        # asyncio is used so we don't need to worry about concurrency on this
-        loop = asyncio.new_event_loop()
-        self.server = None
-        async def run():
-            # logging.basicConfig(level=logging.DEBUG)
-            server = await loop.create_unix_server(
-                lambda: REPLServerProtocol(self, **self.kwargs), self.path)
-            self.server = server
-            logger.info('server started')
-            async with server:
-                logger.info('starting server')
-                try:
-                    await server.serve_forever()
-                except asyncio.CancelledError:
-                    return
-
-        async def check_exit():
-            while not self.need_exit():
-                # print('waiting')
-                await asyncio.sleep(self.CADENCE)
-            if self.server:
-                self.server.close()
-                await self.server.wait_closed()
-
-        server_task = loop.create_task(run())
-        loop.create_task(check_exit())
-        loop.run_until_complete(server_task)  # check_exit terminates the loop
-        logger.info('loop stopped')
-
-    def call_cmd(self, cmd, *args):
-        cmdfunc = self.commands[cmd]  # fine to raise KeyError
-        return cmdfunc(*args)
-
-
-class HQREPLServer(REPLServer):
-    HELP = '''
-    Commands available:
-        h/help [<command>] - prints help
-        tasks - list all tasks
-        artifacts - list all artifacts
-        stop-tasks <pattern> - stop task(s) of the given pattern.
-                              prints tasks issued stop
-        send-event <event-json>
-    '''
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.commands = {
-            'h': self.cmd_help,
-            'help': self.cmd_help,
-            'tasks': self.cmd_tasks,
-            'stop-tasks': self.cmd_stop_tasks,
-        }
-
-    def cmd_help(self, cmd=None):
-        ''' Prints help
-        '''
-        return [self.HELP.strip()]
-
-    def cmd_tasks(self):
-        """
-        """
-        result = ['\t'.join(['name', 'tid', 'running', 'stopping'])]
-        for task in list(self.hq.tasks):
-            running = task.is_alive()
-            tid = None
-            if running:
-                tid = task.get_native_id()
-                stopping = task.need_exit()
-            result.append('\t'.join([task.name, str(tid), str(running), str(stopping)]))
-
-        return result
-
-    def cmd_stop_tasks(self, pattern):
-        """
-        input:
-            task_query: regular expression for task name
-        output:
-            task_name (for every task with stop sent)
-            ...
-        """
-        compiled = re.compile(pattern)
-        result = []
-        for task in self.hq.tasks:
-            if not compiled.search(task.name):
+    async def notify_output(self, hq, stream, pattern, name):
+        while not stream.at_eof():
+            line = await stream.readline()
+            if not line:  # potential EOF emptiness
                 continue
-            
-            if task.is_alive and not task.need_exit():
-                task.exit()
-                result.append(task.name)
-        return result
+            data = line.decode(self.encoding, errors=self.errors)
+            extra = {}
+            if pattern:
+                m = pattern.search(data)
+                if not m:
+                    continue
+                extra = {
+                    'groups': m.groups(),
+                    'groupdict': m.groupdict(),
+                }
+            event = {
+                'kind': 'shell',
+                'topic': 'line',
+                'output': name,
+                'line': data,
+                'task_name': self.name,
+            }
+            event.update(extra)
+            self.send_event(hq, event)
 
-
-def archive_tar(datapath:str, outpath:str,
-                compressor:Literal[None,'gz','bz2','xz']='gz'):
-    import tarfile
-    suffix = '.tar'
-    tarmode = 'w'
-    if compressor:
-        suffix += '.' + compressor
-        tarmode += ':' + compressor
-
-    fd, fpath = tempfile.mkstemp(dir=outpath, prefix='archive-', suffix=suffix)
-    stack = contextlib.ExitStack()
-    try:
-        with stack:
-            f = stack.enter_context(open(fd, 'wb'))
-            tf = stack.enter_context(
-                tarfile.open(fileobj=f, mode=tarmode)
-            )
-            tf.add(datapath)
-    except Exception:
-        os.remove(fpath)
-        raise
-
-
-def archive_zip(datapath:str, outpath:str, ):
-    import zipfile
-    fd, fpath = tempfile.mkstemp(dir=outpath, prefix='archive-', suffix='.zip')
-    stack = contextlib.ExitStack()
-    try:
-        with stack:
-            f = stack.enter_context(open(fd, 'wb'))
-            zf = stack.enter_context(
-                zipfile.ZipFile(f, mode='w', compression=zipfile.ZIP_DEFLATED))
-            
-            for dirpath, dirnames, filenames in os.walk(datapath):
-                print(f'walking {dirpath}')
-                for fn in filenames:
-                    print(fn)
-                    zf.write(os.path.join(dirpath, fn))
-    except Exception:
-        os.remove(fpath)
-        raise
-
-
-class ArtifactRule(object):
-    """The defult rule for processing artifacts"""
-    def __init__(self, hq, upload_attempts=3, max_backoff=60):
-        self.logger = logger.getChild(self.__class__.__name__)
-        self.hq = hq
-        self.upload_attempts = upload_attempts
-        # delay = e^(k * n) - 1 --> k = log(delay - 1) / n
-        k = math.log(max_backoff - 1) / (upload_attempts - 1)
-        self.retry_ladder = [math.exp(k * i) for i in range(1, upload_attempts)]
-        self.timers = []
-
-    def __call__(self, event):
-        hq = self.hq
-        uploader = hq.uploader
-
-        if event.get('kind') != 'artifact':
-            return
-
-        logger = self.logger
-        artifact = event['artifact']
-
-        if not artifact.keep:
-            if not event['topic'] == 'complete':
-                logger.warning('not sure what this event is: %r', event)
-                return
-            # we clean up and forget the thing if not meant to be kept
-            try:
-                shutil.rmtree(str(artifact.path))
-            except Exception:
-                self.logger.exception(
-                    'failed removing files for artifact %r', artifact)
-            hq.forget_artifact(artifact)
-
-        if not uploader:
-            logger.debug('uploader not configured, not uploading %r', artifact)
-            return
-
-        if event['topic'] not in ['complete', 'upload_failure']:
-            logger.warning('not sure what this event is: %r', event)
-            return
-
-        if event['topic'] == 'complete':
-            uploader.upload(artifact)
-        elif event['topic'] == 'upload_failure':
-            if artifact.upload_attempts >= self.upload_attempts:
-                logger.warning('upload retries exhausted for artifact %r',
-                               artifact)
-                return
-            assert 0 <= artifact.upload_attempts < self.upload_attempts
-            self.timers.append(
-                threading.Timer(self.retry_ladder[artifact.upload_attempts], uploader.upload, [artifact]))
-        else:
-            logger.warning('not sure what this event is: %r', event)
-            return
-
-        if artifact.upload_attempts > self.upload_attempts:
-            logger.warning('upload retries exhausted for artifact %r', artifact)
-            return
-        
-
-
-        hq.uploader()
-
-class Uploader(object):
-    """uploader is a retryable interface for uploading a single artifact
-    """
-    def __init__(self):
-        self.logger = logger.getChild(self.__class__.__name__)
-
-    def upload(self, artifact:Artifact):
-        # no error means upload started. Noting it doesn't guarantee upload
-        # success
-        with artifact.lock:
-            if artifact.state != 'complete':
-                raise RuntimeError(
-                    'uploading artifact %r not in complete state' % artifact)
-            assert artifact.upload_state == None
-            artifact.upload_state = 'uploading'
-            artifact.upload_attempts += 1
-
+    async def cancel_process(self, p):
+        p.terminate()
         try:
-            self.try_upload(artifact)
-        except Exception:
-            self.logger.exception('when attempting upload %r', artifact)
-            self.fail(artifact)
+            await asyncio.wait_for(p.wait(), timeout=self.SIGTERM_TIMEOUT)
+            return
+        except asyncio.TimeoutError:
+            self.logger.warning('terminating process timed out')
 
-    def try_upload(self, artifact):
-        """concrete implementation of the uploading logic"""
-        raise NotImplementedError
-
-    def upload_complete(self, artifact):
-        with artifact.lock:
-            assert artifact.state == 'complete'
-            assert artifact.upload_state == 'uploading'
-            artifact.upload_state = 'complete'
-        self.hq.send_event({
-            'kind': 'artifact',
-            'topic': 'upload_complete',
-            'artifact': artifact})
-
-    def fail(self, artifact):
-        with artifact.lock:
-            assert artifact.upload_state == 'uploading'
-            artifact.upload_state = None
-
-        self.hq.send_event({
-            'kind': 'artifact',
-            'topic': 'upload_failure',
-            'artifact': artifact,
-        })
-
-
-class QueuedUploader(Task):
-    CADENCE = 0.2
-    def __init__(self, name, uploader:Uploader):
-        super().__init__()
-        self.queue = queue.SimpleQueue()
-        self.uploader = uploader
-
-    def upload_attempt(self, artifact):
-        self.queue.put(artifact)
-
-    def run_task(self):
-        while not self.need_exit():
-            try:
-                artifact = self.queue.get(timeout=self.CADENCE)
-            except queue.Empty:
-                continue
-
-            try:
-                self.uploader.try_upload()  # make sure uploader is sync
-            except Exception:
-                self.logger.exception('when processing queued %r', artifact)
-                continue            
-
-            self.upload_complete(self, artifact)
-
-
-if __name__ == '__main__':
-    archive_zip('src', '.bash')
+        p.kill()
+        try:
+            await asyncio.wait_for(p.wait(), timeout=self.SIGKILL_TIMEOUT)
+            return
+        except asyncio.TimeoutError:
+            self.logger.error('killing process timed out, giving up')

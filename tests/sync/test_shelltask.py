@@ -1,31 +1,39 @@
-from anykap import *
-import pytest
+# pytest
+import queue
+from anykap.sync import *
 
 
-async def test_shelltask_simple(hq, hqtask):
-    result = asyncio.Future()
+# logging.basicConfig(level=logging.DEBUG)
+
+
+def test_shelltask_simple(hq, hqthread):
+    hq.add_task(ShellTask('foobar', 'echo "FooBar!"; exit 42'))
+    result = False
     def myrule(event):
         if event['kind'] == 'shell':
-            result.set_result(event['topic'] == 'complete' and event['status'] == 42)
+            nonlocal result
+            result = event['topic'] == 'complete' and event['status'] == 42
 
     hq.add_rule(myrule)
-    hq.add_task(ShellTask('foobar', 'echo "FooBar!"; exit 42'))
-    await asyncio.wait_for(result, timeout=3)
-    assert result.result
+    hqthread.start()
+    time.sleep(1)
+    assert result
     # we verify artifacts are there
     my_artifact, = hq.artifacts
     set(child.name for child in my_artifact.path.iterdir()) >= {'sh.stdout', 'sh.stderr', 'sh.result', 'anykap.log'}
     assert (my_artifact.path / 'sh.stdout').read_text().strip() == 'FooBar!'
 
 
-async def test_shelltask_notify(hq, hqtask):
-    q = queue.Queue()
+def test_shelltask_notify(hq, hqthread):
+    q = queue.SimpleQueue()
 
     def myrule(event):
+        # nonlocal q
         if event.get('kind') == 'shell' and event.get('topic') == 'line':
-            q.put_nowait(event)
+            q.put(event)
 
     hq.add_rule(myrule)
+    hqthread.start()
     outnotify = ShellTask(
         'foobarnotify',
         r'''
@@ -37,12 +45,13 @@ async def test_shelltask_notify(hq, hqtask):
         stderr_mode='null'
     )
     hq.add_task(outnotify)
-    event = await asyncio.wait_for(q.get(), timeout=3)
-    q.task_done()
+    event = q.get(timeout=1)
     assert event['kind'] == 'shell' and event['topic'] == 'line'
     assert event['line'].strip() == 'FooBar!' and event['output'] == 'stdout'
-    await asyncio.wait_for(outnotify.join(), timeout=1)
-    assert q.empty()  # we should only have one of such event for now
+    outnotify.join(1)
+    assert not outnotify.is_alive()
+    assert q.empty()
+
     errnotify = ShellTask(
         'errnotify',
         r'''
@@ -53,12 +62,12 @@ async def test_shelltask_notify(hq, hqtask):
         stderr_mode='notify',
     )
     hq.add_task(errnotify)
-    event = await asyncio.wait_for(q.get(), timeout=3)
-    q.task_done()
+    event = q.get(timeout=1)
     assert event['kind'] == 'shell' and event['topic'] == 'line'
     assert event['line'].strip() == 'someerror' and event['output'] == 'stderr'
-    await asyncio.wait_for(errnotify.join(), timeout=1)
-    assert q.empty
+    errnotify.join(1)
+    assert not errnotify.is_alive()
+    assert q.empty()
 
     regexnotify = ShellTask(
         'regexnotify',
@@ -72,10 +81,8 @@ async def test_shelltask_notify(hq, hqtask):
     hq.add_task(regexnotify)
     myresult = [str(i) for i in range(1, 101)]
     myresult = set(s for s in myresult if '9' in s)
-    shellresult = [await asyncio.wait_for(q.get(), timeout=3) for i in range(len(myresult))]
-    for i in shellresult:
-        q.task_done()
-
-    await regexnotify.join()
-    assert q.empty()
+    shellresult = [q.get(timeout=3) for i in range(len(myresult))]
     assert set(e['groupdict']['num'] for e in shellresult) == myresult
+    regexnotify.join(1)
+    assert not regexnotify.is_alive()
+    assert q.empty()

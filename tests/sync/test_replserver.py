@@ -1,5 +1,5 @@
 
-from anykap import *
+from anykap.sync import *
 import socket
 import pytest
 import contextlib

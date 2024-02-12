@@ -1,6 +1,6 @@
 
 # from unittest.mock import Mock, patch
-from anykap import *
+from anykap.sync import *
 
 
 def test_fission(hq, hqthread):
