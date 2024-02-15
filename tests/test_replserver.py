@@ -3,7 +3,8 @@ from anykap import *
 import socket
 import pytest
 import contextlib
-
+import struct
+from queue import SimpleQueue
 
 @pytest.fixture
 def replserver(tmp_path, event_loop):
@@ -14,6 +15,12 @@ def replserver(tmp_path, event_loop):
                 'ping': self.cmd_ping,
                 'nping': self.cmd_nping,
             }
+
+        def call_cmd(self, cmd, *args):
+            """basically, all parsed args are sent here, expects either return"""
+            cmdfunc = self.commands[cmd]  # fine to raise KeyError
+            return cmdfunc(*args)
+
 
         def cmd_ping(self):
             print('got ping!')
@@ -53,12 +60,16 @@ class REPLClient(object):
 
         time.sleep(0.1)  # we wait more patiently for server to start serving
         sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sk.settimeout(2)
+        sk.setblocking(True)
+        sk.settimeout(2)  # no idea why this doesn't work
+        # sk.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, struct.pack('ll', 2, 0))
         sk.connect(str(path))
         self.sk = sk
 
     def send(self, *args):
         sk = self.sk
+        # print('sk timeout:%s' % sk.gettimeout())
+        # print('sk.SO_RCVTIMEO: %s' % sk.getsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO))
         querybytes = shlex.join(args).encode('ascii') + b'\r\n'
         print('querybytes: %r' % querybytes)
         sk.send(querybytes)
@@ -66,8 +77,12 @@ class REPLClient(object):
     def recv(self):
         sk = self.sk
         buffer = bytearray()
+        limit = 100000
         while not buffer.endswith(b'\r\n\r\n'):
-            buffer.extend(sk.recv(1024))
+            # print(f"buffer: {buffer}")
+            data = sk.recv(1024)
+            assert data                
+            buffer.extend(data)
 
         result = buffer.decode('ascii').splitlines(keepends=True)
         print('result: %r' % result)
@@ -82,15 +97,6 @@ class REPLClient(object):
 
     def close(self):
         self.sk.close()
-
-
-# @pytest.fixture
-# def replclient(hq, replserver):
-#     hq.add_task(replserver)
-#     # hqthread.start()
-
-#     with contextlib.closing(REPLClient(replserver.path)) as client:
-#         yield client
 
 
 def test_ok(hq, hqthread, replserver, ):
@@ -121,4 +127,20 @@ def test_tasks(hq, hqthread, hqreplserver):
     hq.add_task(hqreplserver)
     hqthread.start()
     with contextlib.closing(REPLClient(hqreplserver.path)) as replclient:
-        assert replclient.query('tasks') == ['OK', 'name\trunning\tstopping', 'replserver\tTrue\tFalse']
+        assert replclient.query('tasks') == ['OK', 'replserver\tTrue\tFalse']
+
+
+def test_send(hq, hqthread, hqreplserver):
+    hq.add_task(hqreplserver)
+    q = SimpleQueue()
+    def eventrule(event):
+        if event.get('kind') == 'test':
+            q.put_nowait(event)
+    hq.add_rule(eventrule)
+    hqthread.start()
+    with contextlib.closing(REPLClient(hqreplserver.path)) as replclient:
+        assert replclient.query('send', '{"kind": "test", "data": "foobar"}') == ['OK']
+
+    result = q.get(timeout=3)
+    assert result['data'] == 'foobar'
+

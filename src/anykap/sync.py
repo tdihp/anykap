@@ -1184,8 +1184,6 @@ class ArtifactRule(object):
         if artifact.upload_attempts > self.upload_attempts:
             logger.warning('upload retries exhausted for artifact %r', artifact)
             return
-        
-
 
         hq.uploader()
 
@@ -1259,7 +1257,7 @@ class QueuedUploader(Task):
                 self.uploader.try_upload()  # make sure uploader is sync
             except Exception:
                 self.logger.exception('when processing queued %r', artifact)
-                continue            
+                continue
 
             self.upload_complete(self, artifact)
 

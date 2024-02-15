@@ -5,7 +5,7 @@ from pathlib import Path
 import itertools as it
 import asyncio
 import asyncio.queues as queue
-import asyncio.subprocess as subprocess
+import asyncio.subprocess as async_subproc
 import datetime
 import re
 import contextlib
@@ -13,11 +13,20 @@ import platform
 import shutil
 import time
 import shlex
+import argparse
+import io
+import json
+import urllib.request
+import urllib.parse
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 
+__version__ = '0.1.0'
+USER_AGENT = f'anykap/{__version__}'
+
 logger = logging.getLogger('anykap')
-
-
+thread_pool = ThreadPoolExecutor(max_workers=2)
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -323,8 +332,9 @@ class HQ(object):
         for task in self.tasks:
             if task.is_alive():
                 task.exit()
-                waits.append(task)
-        asyncio.gather(*waits)
+                waits.append(asyncio.create_task(task.join()))
+        if waits:
+            await asyncio.wait(waits)
         self.running = False
         await self.queue.join()
         looptask.cancel()
@@ -513,16 +523,16 @@ class ShellTask(Task):
                         # seems to work even when subprocess is test mode
                         open(artifact.path / filename, 'wb'))  
                 elif mode == 'null':
-                    return subprocess.DEVNULL
+                    return async_subproc.DEVNULL
                 elif mode == 'stdout':
-                    return subprocess.STDOUT
+                    return async_subproc.STDOUT
                 elif mode == 'notify':
-                    return subprocess.PIPE
+                    return async_subproc.PIPE
                 raise ValueError(f'unrecognized mode {mode!r}')
 
             stdout = prepare_file(self.stdout_mode, self.STDOUT_FILE)
             stderr = prepare_file(self.stderr_mode, self.STDERR_FILE)
-            p = await subprocess.create_subprocess_exec(
+            p = await async_subproc.create_subprocess_exec(
                 *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
             )
@@ -607,6 +617,15 @@ class ShellTask(Task):
             return
         except asyncio.TimeoutError:
             self.logger.error('killing process timed out, giving up')
+
+
+class REPLHelp(BaseException):
+    def __init__(self, message):
+        super().__init__(message)
+
+    @property
+    def message(self):
+        return self.args[0]
 
 
 class REPLServerProtocol(asyncio.Protocol):
@@ -696,42 +715,81 @@ class REPLServerProtocol(asyncio.Protocol):
         except Exception as e:  # yup we only support ascii
             return self.fail('request cannot be decoded with ascii, %s', str(e))
 
+        verdict = b'OK'
+        body = []
         try:
             cmdline = shlex.split(query)
-            if not cmdline:
-                return self.fail('no command found')
+            # if not cmdline:
+            #     return self.fail('no command found')
 
-            if cmdline[0] in {'exit', 'quit'}:
+            if cmdline and cmdline[0] in {'exit', 'quit'}:
                 self.transport.close()
                 return
 
-            response = self.server.call_cmd(*cmdline)
+            body = self.server.call_cmd(*cmdline)
+        except REPLHelp as e:
+            logger.debug('help raised when calling cmd')
+            body = list(filter(
+                None,
+                (line.rstrip() for line in e.message.splitlines())))
         except Exception as e:
             logger.exception('got exception when calling cmd')
-            self.transport.write(b'ERR' + self.newline)
-            self.transport.write(self.sanitize(repr(e)) + self.newline * 2)
-            self.transport.close()
-            return
+            verdict = b'ERR'
+            body = [str(e)]
 
-        self.transport.write(b'OK' + self.newline)
-        for row in response:
+        self.transport.write(verdict + self.newline)
+        for row in body:
             self.transport.write(self.sanitize(row) + self.newline)
 
         self.transport.write(self.newline)
+        if verdict == b'ERR':
+            self.transport.close()
+            return
+
         self.listening()
 
     def sanitize(self, data):
         """we make sure there's no empty new lines in data"""
         return re.sub(
             br'(%s)+' % re.escape(self.newline), self.newline,
-            data.encode('ascii', errors='replace').strip(self.newline))
+            data.encode('ascii', errors='replace').rstrip(self.newline))
 
     def fail(self, reason, *args):
         self.logger.info('connection failed: ' + reason, *args)
         self.transport.close()
 
 
+class REPLHelpAction(argparse.Action):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default, nargs=0,
+            help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise REPLHelp(parser.format_help())
+
+
+class REPLArgumentParser(argparse.ArgumentParser):
+    """customize argparse to get help"""
+    def __init__(self, *args, add_help=True, **kwargs):
+        super().__init__(*args, exit_on_error=False, add_help=False, **kwargs)
+        self.register('action', 'replhelp', REPLHelpAction)
+        if add_help:
+            self.add_argument('-h', '--help', action='replhelp',
+                              help='show this help message')
+
+    def exit(self, *args, **kwargs):
+        raise RuntimeError('ArgumentParser.exit is accedentially triggered')
+
+    def error(self, message):
+        args = {'prog': self.prog, 'message': message}
+        detail = '%(prog)s: error: %(message)s\n' % args
+        raise REPLHelp(self.format_usage() + detail)
+
+
 class REPLServer(Task):
+    parser = argparse.ArgumentParser('replserver')
     def __init__(self, path, name='replserver', **kwargs):
         """
         path is relative to hq.path
@@ -749,71 +807,243 @@ class REPLServer(Task):
         async with server:
             await self.wait_exit()
 
-    def call_cmd(self, cmd, *args):
-        cmdfunc = self.commands[cmd]  # fine to raise KeyError
-        return cmdfunc(*args)
+    def call_cmd(self, *args):
+        raise NotImplementedError()
 
 
 class HQREPLServer(REPLServer):
-    HELP = '''
-    Commands available:
-        h/help [<command>] - prints help
-        tasks - list all tasks
-        artifacts - list all artifacts
-        stop-tasks <pattern> - stop task(s) of the given pattern.
-                              prints tasks issued stop
-        send-event <event-json>
-    '''
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.commands = {
-            'h': self.cmd_help,
-            'help': self.cmd_help,
-            'tasks': self.cmd_tasks,
-            'stop-tasks': self.cmd_stop_tasks,
-        }
+    def __init__(self, path='repl.sock', *args, **kwargs):
+        super().__init__(path, *args, **kwargs)
+        parser = REPLArgumentParser(prog=self.name)
+        subparsers = parser.add_subparsers(dest='command', required=True)
+        info = subparsers.add_parser('info', aliases=['i'])
+        info.set_defaults(func=self.cmd_info)
+        tasks = subparsers.add_parser(
+            'tasks', aliases=['t', 'task'], help='task management')
+        tasks.set_defaults(func=self.cmd_tasks)
+        tasks.add_argument('-s', '--stop', default='list',
+                           dest='verb', action='store_const', const='stop',
+                           help='stop tasks if provided, otherwise list tasks')
+        tasks.add_argument('-r', '--regex', action='store_true',
+                           help='filter task name with regular expression')
+        tasks.add_argument('-a', '--all', action='store_true',
+                           help='show all tasks, including stopped')
+        tasks.add_argument('name', nargs='*',
+                           help='task name or pattern, must exist for stop')
+        artifacts = subparsers.add_parser(
+            'artifacts', aliases=['a', 'artifact'], help='artifact management')
+        artifacts.set_defaults(func=self.cmd_artifacts)
+        send = subparsers.add_parser('send', help='send a event to hq')
+        send.add_argument('event', type=json.loads, help='event in json')
+        send.set_defaults(func=self.cmd_send)
+        self.parser = parser
 
     async def run_task(self, hq):
         self.hq = hq
         return await super().run_task(hq)
 
-    def cmd_help(self, cmd=None):
-        ''' Prints help
-        '''
-        return [self.HELP.strip()]
+    def call_cmd(self, *args):
+        parser = self.parser
+        args = parser.parse_args(args)
+        self.logger.debug('args: %r', args)
+        return args.func(args)
 
-    def cmd_tasks(self):
-        """
-        """
-        result = ['\t'.join(['name', 'running', 'stopping'])]
-        for task in list(self.hq.tasks):
-            running = task.is_alive()
-            stopping = False
-            if running:
-                stopping = task.need_exit()
-            result.append('\t'.join([task.name, str(running), str(stopping)]))
+    def cmd_tasks(self, args):
+        verb = args.verb
+        name = args.name
+        regex = args.regex
+        if not name and verb == 'stop':
+            self.parser.error('task name must exist for stop')
+        tasks = list(self.hq.tasks)
+        if all and verb == 'list':
+            tasks += self.hq.done_tasks
+        else:
+            tasks = list(task for task in tasks if task.is_alive())
 
-        return result
-
-    def cmd_stop_tasks(self, pattern):
-        """
-        input:
-            task_query: regular expression for task name
-        output:
-            task_name (for every task with stop sent)
-            ...
-        """
-        compiled = re.compile(pattern)
-        result = []
-        for task in self.hq.tasks:
-            if not compiled.search(task.name):
-                continue
-            
-            if task.is_alive and not task.need_exit():
+        if name:
+            if regex:
+                patterns = list(map(re.compile, name))
+                tasks = list(task for task in tasks
+                             if any(pattern.search(task.name)
+                                    for pattern in patterns))
+            else:
+                tasks = [task for task in tasks if task.name in name]
+        if verb == 'list':
+            return list(map(self.format_task_tsv, tasks))
+        else:
+            assert verb == 'stop'
+            tasks = list(task for task in tasks if not task.need_exit())
+            for task in tasks:
                 task.exit()
-                result.append(task.name)
-        return result
+            return list(map(self.format_task_tsv, tasks))
+
+    def format_task_tsv(self, task):
+        running = task.is_alive()
+        stopping = False
+        if running:
+            stopping = task.need_exit()
+        return '\t'.join([task.name, str(running), str(stopping)])
+
+    def cmd_artifacts(self, args):
+        return []
+
+    def cmd_send(self, args):
+        event = args.event
+        self.send_event(self.hq, event)
+        return []
+
+    def cmd_info(self, args):
+        return []
 
 
+VALID_DOMAINS = [
+    '.blob.core.windows.net',
+    '.blob.core.chinacloudapi.cn',
+    '.blob.core.usgovcloudapi.net',
+    '.blob.core.cloudapi.de'
+]
+
+AZUREBLOB_ACCOUNT_PATTERN = r'[a-z0-9]{3,24}'
+# https://stackoverflow.com/a/35130142/1000290
+AZUREBLOB_CONTAINER_PATTERN = r'[a-z0-9](?!.*--)[-a-z0-9]{1,61}[a-z0-9]'
+AZUREBLOB_FQDN_PATTERN = (
+    r'(?P<account>' + AZUREBLOB_ACCOUNT_PATTERN + r')'
+    + '|'.join(map(re.escape, VALID_DOMAINS)))
+# a best-effort IP addr matching
+IPPORT_PATTERN = r'(?P<addr>.*?)(:(?P<port>\d+))?$'
+
+def azureblob_make_url(filename:str, url=None, scheme=None, account=None,
+                       container=None, directory=None, sas=None, ):
+    """
+    netloc can be FQDN or ip:port, ip:port should only be for local testing
+    account can be either account name or FQDN
+    """
+    defaults = { # the default setting
+        'scheme': 'https',
+        'directory': '',
+        'sas': '',
+    }
+    config = {}
+    def set_config(k, v):
+        if v:
+            if config.get(k, v) != v:
+                raise ValueError(f'inconsistent setting for {k}: '
+                        f'{config[k]!r} != {v!r}')
+            config[k] = v
+
+    set_config('scheme', scheme)
+    if account:
+        if re.fullmatch(AZUREBLOB_ACCOUNT_PATTERN, account):
+            set_config('account', account)
+        else:
+            m = re.fullmatch(AZUREBLOB_FQDN_PATTERN, account)
+            if m:
+                d = m.groupdict()
+                set_config('account', d['account'])
+                set_config('fqdn', account)
+            else:
+                raise ValueError(
+                    f'account {account} is not valid Azure storage account')
+
+    set_config('container', container)
+    set_config('directory', directory)
+    if sas:
+        sas = sas.lstrip('?')
+    set_config('sas', sas)
+
+    if url:
+        use_ipaddr=False
+        parsed = urllib.parse.urlparse(url)
+        set_config('scheme', parsed.scheme)
+        if parsed.netloc:
+            m = re.fullmatch(AZUREBLOB_FQDN_PATTERN, parsed.netloc)
+            if m:
+                d = m.groupdict()
+                set_config('account', d['account'])
+                set_config('fqdn', parsed.netloc)
+            else:
+                m = re.fullmatch(IPPORT_PATTERN, parsed.netloc)
+                if not m:
+                    raise ValueError(
+                        f'failed to parse netloc {parsed.netloc} as ip:port')
+                d = m.groupdict()
+                try:
+                    ipaddress.ip_address(d['addr'])
+                except ValueError as e:
+                    raise ValueError(f'unable to parse addr {d["addr"]}') from e
+                set_config('ipport',  parsed.netloc)
+
+        if parsed.fragment or parsed.params:
+            raise ValueError(f'unrecognizable url {url}')
+        path = [None] * 2
+        if parsed.path:
+            path = parsed.path.strip('/').split('/')
+            if 'ipport' in config:
+                if path:
+                    set_config('account', path.pop(0))
+            if path:
+                set_config('container', path.pop(0))
+            if path:
+                set_config('directory', '/'.join(path))
+
+    config = defaults | config
+    try:
+        if not re.fullmatch(AZUREBLOB_ACCOUNT_PATTERN, config['account']):
+            raise ValueError(f'invalid account {account}')
+        if not re.fullmatch(AZUREBLOB_CONTAINER_PATTERN, config['container']):
+            raise ValueError(f'invalid container {container}')
+        path = '/' + config['container'] + '/'
+        if config['directory']:
+            path += config['directory'] + '/'
+        path += filename
+        if 'ipport' in config:
+            path = '/' + config['account'] + path
+            return urllib.parse.urlunparse((
+                config['scheme'], config['ipport'], path, '', config['sas'], '')
+            )
+        elif 'fqdn' not in config:
+            config['fqdn'] = config['account'] + '.blob.core.windows.net'
+        return urllib.parse.urlunparse(
+            (config['scheme'], config['fqdn'], path, '', config['sas'], '')
+        )
+    except KeyError as e:
+        key, = e.args
+        raise ValueError(f'key {key} not provided in upload setting')
 
 
+def urlopen_worker(request, options):
+    logger.debug('sending request with headers: %s', request.headers)
+    with urllib.request.urlopen(request, **options) as f:
+        logger.debug('url %s got status: %s, headers: %s',
+                     f.url, f.status, f.headers)
+        logger.debug('body: %r', f.read())
+
+
+async def upload_azureblob(path, urlopen_options=None, **kwargs,):
+    """upload file at path to the given azure blob storage account
+    implements the uploader interface.
+    We always use a SAS token authorization, other authorization methods are not
+    supported.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f'path {path} not a file')
+
+    upload_url = azureblob_make_url(path.name, **kwargs)
+    logger.debug('uploading using url %s', upload_url)
+    # caller should guarantee sure no further change to the file
+    size = path.stat().st_size  
+    with path.open('rb') as f:
+        # https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob
+        request = urllib.request.Request(
+            url=upload_url, method="PUT", data=f, headers={
+                'Content-Length': str(size),
+                'Content-Type': 'application/octet-stream',
+                'User-Agent': USER_AGENT,
+                'Date': datetime.datetime.utcnow().strftime(
+                    '%a, %d %b %Y %H:%M:%S GMT'),
+                'x-ms-version': '2023-11-03',
+                'x-ms-blob-type': 'BlockBlob',
+            })
+        await asyncio.get_running_loop().run_in_executor(
+            thread_pool, urlopen_worker, request, urlopen_options or {})

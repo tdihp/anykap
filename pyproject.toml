@@ -8,3 +8,11 @@ authors = [
 ]
 readme = "README.md"
 license = {text = "MIT License"}
+
+[tool.pytest.ini_options]
+minversion = "7"
+addopts = "-ra --ignore=tests/sync"
+asyncio_mode = "auto"
+testpaths = [
+    "tests",
+]

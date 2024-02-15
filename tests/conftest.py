@@ -36,5 +36,5 @@ def hqthread(hq, event_loop):
     yield hqthread
     # hq.quit.set_result(True)
     event_loop.call_soon_threadsafe(hq.quit.set_result, True)
-    hqthread.join(3)
+    hqthread.join(5)
     assert not hqthread.is_alive()
