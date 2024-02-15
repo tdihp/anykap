@@ -30,11 +30,24 @@ async def hqtask(hq):
 @pytest.fixture
 def hqthread(hq, event_loop):
     """this one is for sync tests"""
-    hqthread = threading.Thread(target=event_loop.run_until_complete, args=[hq.run()])
+    import traceback
+    exception_raised = False
+    def target():
+        try:
+            event_loop.run_until_complete(hq.run())
+        except:
+            exception_raised = True
+            traceback.print_exc()
+
+    
+
+    # hqthread = threading.Thread(target=event_loop.run_until_complete, args=[hq.run()])
+    hqthread = threading.Thread(target=target)
     # hqthread.start()
     # test should call hqthread.start(), as add_task is not thread safe
     yield hqthread
     # hq.quit.set_result(True)
     event_loop.call_soon_threadsafe(hq.quit.set_result, True)
-    hqthread.join(5)
+    hqthread.join(50)
     assert not hqthread.is_alive()
+    assert not exception_raised

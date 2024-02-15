@@ -145,12 +145,12 @@ async def test_azureblob_upload_working(
     data = ''.join(lines).encode('utf-8')
     # print(f'lines: {lines}')
     blobfile.write_bytes(data)
-    await upload_azureblob(
-        blobfile,
+    uploader = AzureBlobUploader(
         account=storage_account, container=container_name, sas=sas,
         url=f'https://127.0.0.1:{blob_port}',
         urlopen_options={'context': ssl_context}
     )
+    await uploader.upload(blobfile,)
     downloader = container_client.download_blob('blobdata_working')
     assert downloader.readall() == data
 
@@ -164,13 +164,13 @@ async def test_azureblob_upload_container_notfound(
     lines, _ = getsourcelines(sys.modules[__name__])
     blobfile.write_text(''.join(lines))
 
+    uploader = AzureBlobUploader(
+        account=storage_account, container=another_container, sas=sas,
+        url=f'https://127.0.0.1:{blob_port}',
+        urlopen_options={'context': ssl_context}
+    )
     with pytest.raises(urllib.error.HTTPError):
-        await upload_azureblob(
-            blobfile,
-            account=storage_account, container=another_container, sas=sas,
-            url=f'https://127.0.0.1:{blob_port}',
-            urlopen_options={'context': ssl_context}
-        )
+        await uploader.upload(blobfile)
     # assert False
 
 

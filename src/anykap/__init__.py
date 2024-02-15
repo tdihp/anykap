@@ -118,16 +118,16 @@ class FutureReceptor(Receptor):
     """ a future -> value receptor, only wait once, typical for exit receptor """
     def __init__(self, initial_value=False):
         super().__init__()
-        self.future = asyncio.Future()
+        # self.future = asyncio.Future()
+        self._waiters = set()
         self.value = initial_value
     
     def send(self, event):
-        # unconditionally mark future done
-        if self.future.done():
-            return
-
         self.value = event
-        self.future.set_result(None)
+        while self._waiters:
+            waiter = self._waiters.pop()
+            if not waiter.done():
+                waiter.set_result(event)
 
     def get_nowait(self):
         return self.value
@@ -135,7 +135,15 @@ class FutureReceptor(Receptor):
     async def get(self, ):
         # done, pending = await asyncio.wait([self.future], timeout=timeout)
         # regardless of timeout or not, we return the value.
-        await self.future
+        loop = asyncio.get_running_loop()
+        waiter = asyncio.Future(loop=loop)
+        self._waiters.add(waiter)
+        try:
+            await waiter
+        except:
+            waiter.cancel()
+            self._waiters.discard(waiter)
+            raise
         return self.value
 
 
@@ -276,7 +284,7 @@ class Task(object):
 
     async def join(self):
         # only call this after start
-        if self.task:
+        if self.task and not self.task.done():
             await self.task
 
     def is_alive(self):
@@ -326,22 +334,20 @@ class HQ(object):
             self.logger.debug('starting task %s', task)
             task.start(self)
 
-        looptask = asyncio.create_task(self.loop())
+        looptask = asyncio.create_task(self.loop(), name='hqloop')
         await self.quit
         waits = []
         for task in self.tasks:
             if task.is_alive():
                 task.exit()
-                waits.append(asyncio.create_task(task.join()))
+                waits.append(asyncio.create_task(task.join(), name=f'wait-for-task-{task.name}'))
+        # raise Exception('oops')
         if waits:
             await asyncio.wait(waits)
         self.running = False
         await self.queue.join()
         looptask.cancel()
-        try:
-            await looptask
-        except asyncio.CancelledError:
-            pass
+        await asyncio.wait([looptask])
 
     async def loop(self):
         """execute event processing logic for one loop"""
@@ -540,19 +546,21 @@ class ShellTask(Task):
             if self.stdout_mode == 'notify':
                 notify_tasks.append(asyncio.create_task(self.notify_output(
                     hq, p.stdout, self.stdout_filter, 'stdout'
-                )))
+                ), name=f'{self.name}-notify-stdout'))
             if self.stderr_mode == 'notify':
                 notify_tasks.append(asyncio.create_task(self.notify_output(
                     hq, p.stderr, self.stderr_filter, 'stderr'
-                )))
+                ), name=f'{self.name}-notify-stderr'))
 
-            wait_exit_task = asyncio.create_task(self.wait_exit())
-            wait_p_task = asyncio.create_task(p.wait())
+            wait_exit_task = asyncio.create_task(self.wait_exit(), name=f'{self.name}-wait-exit')
+            wait_p_task = asyncio.create_task(p.wait(), name=f'{self.name}-wait-p')
             done, pending = await asyncio.wait(
                 [wait_exit_task, wait_p_task],
                 timeout=self.timeout,
                 return_when=asyncio.FIRST_COMPLETED)
-
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending)
             need_cancel = True
             if wait_p_task in done:
                 need_cancel = False
@@ -803,7 +811,6 @@ class REPLServer(Task):
         server = await asyncio.get_running_loop().create_unix_server(
             lambda: REPLServerProtocol(self, **self.kwargs),
             hq.datapath / self.path)
-        logger.info('server started')
         async with server:
             await self.wait_exit()
 
@@ -1019,31 +1026,81 @@ def urlopen_worker(request, options):
         logger.debug('body: %r', f.read())
 
 
-async def upload_azureblob(path, urlopen_options=None, **kwargs,):
-    """upload file at path to the given azure blob storage account
-    implements the uploader interface.
-    We always use a SAS token authorization, other authorization methods are not
-    supported.
-    """
-    path = Path(path)
-    if not path.is_file():
-        raise RuntimeError(f'path {path} not a file')
+class Uploader(object):
+    """uploader interface"""
+    async def upload(path:Path):
+        """path given is a file, not supposed to be changing"""
+        raise NotImplementedError 
 
-    upload_url = azureblob_make_url(path.name, **kwargs)
-    logger.debug('uploading using url %s', upload_url)
-    # caller should guarantee sure no further change to the file
-    size = path.stat().st_size  
-    with path.open('rb') as f:
-        # https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob
-        request = urllib.request.Request(
-            url=upload_url, method="PUT", data=f, headers={
-                'Content-Length': str(size),
-                'Content-Type': 'application/octet-stream',
-                'User-Agent': USER_AGENT,
-                'Date': datetime.datetime.utcnow().strftime(
-                    '%a, %d %b %Y %H:%M:%S GMT'),
-                'x-ms-version': '2023-11-03',
-                'x-ms-blob-type': 'BlockBlob',
-            })
+
+class AzureBlobUploader(Uploader):
+    def __init__(self, urlopen_options=None, **kwargs):
+        super().__init__()
+        self.urlopen_options = urlopen_options
+        # validate the storage option just to be sure
+        try:
+            azureblob_make_url('contoso', **kwargs)
+        except Exception as e:
+            raise ValueError('Invalid azure blob configuration') from e
+        self.blob_options = kwargs
+        self.urlopen_options = urlopen_options or {}
+
+    async def upload(self, path):
+        path = Path(path)
+        if not path.is_file():
+            raise RuntimeError(f'path {path} not a file')
+
+        upload_url = azureblob_make_url(path.name, **self.blob_options)
+        logger.debug('uploading using url %s', upload_url)
+        # caller should guarantee sure no further change to the file
+        size = path.stat().st_size  
+        with path.open('rb') as f:
+            # https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob
+            request = urllib.request.Request(
+                url=upload_url, method="PUT", data=f, headers={
+                    'Content-Length': str(size),
+                    'Content-Type': 'application/octet-stream',
+                    'User-Agent': USER_AGENT,
+                    'Date': datetime.datetime.utcnow().strftime(
+                        '%a, %d %b %Y %H:%M:%S GMT'),
+                    'x-ms-version': '2023-11-03',
+                    'x-ms-blob-type': 'BlockBlob',
+                })
+            # we don't want loop to be blocked, therefore using thread pool.
+            await asyncio.get_running_loop().run_in_executor(
+                thread_pool, urlopen_worker, request, self.urlopen_options)
+
+
+class CopyUploader(Uploader):
+    def __init__(self, destdir):
+        destdir = Path(destdir)
+        if not destdir.is_dir():
+            raise RuntimeError(f'dest {destdir} not a directory')
+        self.destdir = destdir
+
+    async def upload(self, path):
+        if not path.is_file():
+            raise RuntimeError(f'path {path} is not a file')
+
         await asyncio.get_running_loop().run_in_executor(
-            thread_pool, urlopen_worker, request, urlopen_options or {})
+            thread_pool, shutil.copyfile, path, self.destdir/path.name
+        )
+
+class Archiver(object):
+    """archives a directory into a file"""
+    async def archive(self, path):
+        pass
+
+
+
+class ArtifactManager(Task):
+    """upload manager is a optional rule that handles archiving and uploading
+    basically, manager picks up artifact completion events, then
+    archive -> upload the artifact. Marks artifact uploaded / failed accordingly
+    """
+    def __init__(self, archiver, uploader, name='artifact-manager'):
+        super().__init__(self, name)
+        self.receptors['']
+    # XXX: handle exceptions and retry. currently we mark artifact as failed
+    # def filter_event()
+
