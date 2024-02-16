@@ -319,7 +319,10 @@ class HQ(object):
         self.rules = []
         datapath = datapath or os.environ.get('ANYKAP_PATH', os.getcwd())
         self.datapath = Path(datapath).absolute()
-        self.datapath.mkdir(parents=True, exist_ok=True)
+        # self.datapath.mkdir(parents=True, exist_ok=True)
+        if not self.datapath.is_dir():
+            logger.warning('supplied datapath for hq %s not a directory',
+                           self.datapath)
         self.running = False
         self._quit = None # external trigger for test
         self.queue = queue.Queue()
