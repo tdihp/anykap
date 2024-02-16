@@ -22,6 +22,7 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 
+# XXX: make __all__
 __version__ = '0.1.0'
 USER_AGENT = f'anykap/{__version__}'
 
@@ -320,7 +321,7 @@ class HQ(object):
         self.datapath = Path(datapath).absolute()
         self.datapath.mkdir(parents=True, exist_ok=True)
         self.running = False
-        self.quit = asyncio.Future(loop=loop) # external trigger for test
+        self._quit = None # external trigger for test
         self.queue = queue.Queue()
         self.artifact_counter = it.count()
         self.artifacts = []
@@ -335,7 +336,8 @@ class HQ(object):
             task.start(self)
 
         looptask = asyncio.create_task(self.loop(), name='hqloop')
-        await self.quit
+        self._quit = asyncio.Future()
+        await self._quit
         waits = []
         for task in self.tasks:
             if task.is_alive():
@@ -348,6 +350,14 @@ class HQ(object):
         await self.queue.join()
         looptask.cancel()
         await asyncio.wait([looptask])
+
+    def quit(self):
+        if self._quit:
+            self._quit.set_result(None)
+
+    def quit_threadsafe(self):
+        if self._quit:
+            self._quit.get_loop().call_soon_threadsafe(self.quit)
 
     async def loop(self):
         """execute event processing logic for one loop"""

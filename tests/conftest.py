@@ -15,15 +15,13 @@ def logconf(caplog):
 @pytest.fixture
 def hq(tmp_path, event_loop):
     return HQ(datapath=tmp_path / 'hq', loop=event_loop)
-    # yield hq
-    # await asyncio.wait_for(hqtask, timeout=5)  # 5 secs should be enough
 
 
 @pytest_asyncio.fixture
 async def hqtask(hq):
     hqtask = asyncio.create_task(hq.run())
     yield hqtask
-    hq.quit.set_result(True)
+    hq.quit()
     await asyncio.wait_for(hqtask, timeout=5)
 
 
@@ -36,18 +34,13 @@ def hqthread(hq, event_loop):
         try:
             event_loop.run_until_complete(hq.run())
         except:
+            nonlocal exception_raised
             exception_raised = True
             traceback.print_exc()
 
-    
-
-    # hqthread = threading.Thread(target=event_loop.run_until_complete, args=[hq.run()])
     hqthread = threading.Thread(target=target)
-    # hqthread.start()
-    # test should call hqthread.start(), as add_task is not thread safe
     yield hqthread
-    # hq.quit.set_result(True)
-    event_loop.call_soon_threadsafe(hq.quit.set_result, True)
+    hq.quit_threadsafe()
     hqthread.join(50)
     assert not hqthread.is_alive()
     assert not exception_raised
