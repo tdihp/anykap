@@ -1,0 +1,11 @@
+resources:
+- daemonset.yaml
+commonLabels:
+  app.kubernetes.io/name: anykap
+  app.kubernetes.io/instance: "{name}"
+  app.kubernetes.io/managed-by: "kubectl-anykap"
+configMapGenerator:
+- name: env
+  files:
+{cmfiles}
+namePrefix: "{name}-"

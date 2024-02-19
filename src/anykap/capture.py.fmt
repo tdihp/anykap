@@ -1,0 +1,9 @@
+from anykap import *
+
+hq = HQ(datapath="/var/lib/anykap/{name}")
+
+# used for communication
+hq.add_task(HQREPLServer(path="/var/run/anykap-{name}.sock"))
+
+# add your capturing tasks/rules here
+main(hq)

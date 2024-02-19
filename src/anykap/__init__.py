@@ -1117,3 +1117,6 @@ class ArtifactManager(Task):
     # XXX: handle exceptions and retry. currently we mark artifact as failed
     # def filter_event()
 
+
+def main(hq):
+    asyncio.run(hq.run())

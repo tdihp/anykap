@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: anykap
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: "Default"
+      hostIPC: true
+      hostNetwork: true
+      hostPID: true
+      hostUsers: true
+      # securityContext:
+      # tolerations:
+      volumes:
+      - hostPath:
+          path: /
+          type: ""
+        name: host-root
+      containers:
+      - name: anykap
+        image: alpine:3  # customize this if needed
+        # image: python:3-slim  # Use this one if pod volume is wanted
+        resources:
+          limits:
+            cpu: 100m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        # env:
+        envFrom:
+          - configMapRef:
+              name: env
+        securityContext:
+          # runAsUser: 
+          # allowPrivilegeEscalation: 
+          capabilities:
+            add:
+            - NET_ADMIN
+            # - CAP_SYS_ADMIN
+            # drop:
+            # - 
+          # privileged: true
+        volumeMounts:
+        - mountPath: /host
+          name: host-root
+        command:
+          - chroot
+          - /host
+          - python3
+          - -c
+          - |
+            $(envimporter.py)
+            install_envimporter(valid_prefix="anykap")
+            $(capture.py)

@@ -1,6 +1,5 @@
 [project]
-name = "AnyKap"
-version = "0.1.0"
+name = "anykap"
 description = "A simple toolkit aiding capturing in Kubernetes Linux nodes"
 requires-python = ">=3.9"
 authors = [
@@ -8,6 +7,10 @@ authors = [
 ]
 readme = "README.md"
 license = {text = "MIT License"}
+dynamic = ["version"]
+dependencies = [
+  "pyyaml >= 6"
+]
 
 [tool.pytest.ini_options]
 minversion = "7"
@@ -16,3 +19,15 @@ asyncio_mode = "auto"
 testpaths = [
     "tests",
 ]
+
+[project.gui-scripts]
+kubectl-anykap = "anykap.client:main"
+
+[tool.hatch]
+
+[tool.hatch.version]
+path = "src/anykap/__init__.py"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
