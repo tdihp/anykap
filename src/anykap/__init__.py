@@ -16,10 +16,8 @@ import shlex
 import argparse
 import io
 import json
-import urllib.request
-import urllib.parse
-import ipaddress
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 # XXX: make __all__
@@ -27,7 +25,6 @@ __version__ = '0.1.0'
 USER_AGENT = f'anykap/{__version__}'
 
 logger = logging.getLogger('anykap')
-thread_pool = ThreadPoolExecutor(max_workers=2)
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -565,7 +562,8 @@ class ShellTask(Task):
                     hq, p.stderr, self.stderr_filter, 'stderr'
                 ), name=f'{self.name}-notify-stderr'))
 
-            wait_exit_task = asyncio.create_task(self.wait_exit(), name=f'{self.name}-wait-exit')
+            wait_exit_task = asyncio.create_task(self.wait_exit(),
+                                                 name=f'{self.name}-wait-exit')
             wait_p_task = asyncio.create_task(p.wait(), name=f'{self.name}-wait-p')
             done, pending = await asyncio.wait(
                 [wait_exit_task, wait_p_task],
@@ -916,194 +914,15 @@ class HQREPLServer(REPLServer):
         return []
 
 
-VALID_DOMAINS = [
-    '.blob.core.windows.net',
-    '.blob.core.chinacloudapi.cn',
-    '.blob.core.usgovcloudapi.net',
-    '.blob.core.cloudapi.de'
-]
-
-AZUREBLOB_ACCOUNT_PATTERN = r'[a-z0-9]{3,24}'
-# https://stackoverflow.com/a/35130142/1000290
-AZUREBLOB_CONTAINER_PATTERN = r'[a-z0-9](?!.*--)[-a-z0-9]{1,61}[a-z0-9]'
-AZUREBLOB_FQDN_PATTERN = (
-    r'(?P<account>' + AZUREBLOB_ACCOUNT_PATTERN + r')'
-    + '|'.join(map(re.escape, VALID_DOMAINS)))
-# a best-effort IP addr matching
-IPPORT_PATTERN = r'(?P<addr>.*?)(:(?P<port>\d+))?$'
-
-def azureblob_make_url(filename:str, url=None, scheme=None, account=None,
-                       container=None, directory=None, sas=None, ):
-    """
-    netloc can be FQDN or ip:port, ip:port should only be for local testing
-    account can be either account name or FQDN
-    """
-    defaults = { # the default setting
-        'scheme': 'https',
-        'directory': '',
-        'sas': '',
-    }
-    config = {}
-    def set_config(k, v):
-        if v:
-            if config.get(k, v) != v:
-                raise ValueError(f'inconsistent setting for {k}: '
-                        f'{config[k]!r} != {v!r}')
-            config[k] = v
-
-    set_config('scheme', scheme)
-    if account:
-        if re.fullmatch(AZUREBLOB_ACCOUNT_PATTERN, account):
-            set_config('account', account)
-        else:
-            m = re.fullmatch(AZUREBLOB_FQDN_PATTERN, account)
-            if m:
-                d = m.groupdict()
-                set_config('account', d['account'])
-                set_config('fqdn', account)
-            else:
-                raise ValueError(
-                    f'account {account} is not valid Azure storage account')
-
-    set_config('container', container)
-    set_config('directory', directory)
-    if sas:
-        sas = sas.lstrip('?')
-    set_config('sas', sas)
-
-    if url:
-        use_ipaddr=False
-        parsed = urllib.parse.urlparse(url)
-        set_config('scheme', parsed.scheme)
-        if parsed.netloc:
-            m = re.fullmatch(AZUREBLOB_FQDN_PATTERN, parsed.netloc)
-            if m:
-                d = m.groupdict()
-                set_config('account', d['account'])
-                set_config('fqdn', parsed.netloc)
-            else:
-                m = re.fullmatch(IPPORT_PATTERN, parsed.netloc)
-                if not m:
-                    raise ValueError(
-                        f'failed to parse netloc {parsed.netloc} as ip:port')
-                d = m.groupdict()
-                try:
-                    ipaddress.ip_address(d['addr'])
-                except ValueError as e:
-                    raise ValueError(f'unable to parse addr {d["addr"]}') from e
-                set_config('ipport',  parsed.netloc)
-
-        if parsed.fragment or parsed.params:
-            raise ValueError(f'unrecognizable url {url}')
-        path = [None] * 2
-        if parsed.path:
-            path = parsed.path.strip('/').split('/')
-            if 'ipport' in config:
-                if path:
-                    set_config('account', path.pop(0))
-            if path:
-                set_config('container', path.pop(0))
-            if path:
-                set_config('directory', '/'.join(path))
-
-    config = defaults | config
-    try:
-        if not re.fullmatch(AZUREBLOB_ACCOUNT_PATTERN, config['account']):
-            raise ValueError(f'invalid account {account}')
-        if not re.fullmatch(AZUREBLOB_CONTAINER_PATTERN, config['container']):
-            raise ValueError(f'invalid container {container}')
-        path = '/' + config['container'] + '/'
-        if config['directory']:
-            path += config['directory'] + '/'
-        path += filename
-        if 'ipport' in config:
-            path = '/' + config['account'] + path
-            return urllib.parse.urlunparse((
-                config['scheme'], config['ipport'], path, '', config['sas'], '')
-            )
-        elif 'fqdn' not in config:
-            config['fqdn'] = config['account'] + '.blob.core.windows.net'
-        return urllib.parse.urlunparse(
-            (config['scheme'], config['fqdn'], path, '', config['sas'], '')
-        )
-    except KeyError as e:
-        key, = e.args
-        raise ValueError(f'key {key} not provided in upload setting')
-
-
-def urlopen_worker(request, options):
-    logger.debug('sending request with headers: %s', request.headers)
-    with urllib.request.urlopen(request, **options) as f:
-        logger.debug('url %s got status: %s, headers: %s',
-                     f.url, f.status, f.headers)
-        logger.debug('body: %r', f.read())
-
-
 class Uploader(object):
-    """uploader interface"""
-    async def upload(path:Path):
-        """path given is a file, not supposed to be changing"""
-        raise NotImplementedError 
+    """uploader interface. Uploader should eitehr implement the async or the
+    sync version"""
 
+    async def upload_async(path:Path):
+        raise NotImplementedError
 
-class AzureBlobUploader(Uploader):
-    def __init__(self, urlopen_options=None, **kwargs):
-        super().__init__()
-        self.urlopen_options = urlopen_options
-        # validate the storage option just to be sure
-        try:
-            azureblob_make_url('contoso', **kwargs)
-        except Exception as e:
-            raise ValueError('Invalid azure blob configuration') from e
-        self.blob_options = kwargs
-        self.urlopen_options = urlopen_options or {}
-
-    async def upload(self, path):
-        path = Path(path)
-        if not path.is_file():
-            raise RuntimeError(f'path {path} not a file')
-
-        upload_url = azureblob_make_url(path.name, **self.blob_options)
-        logger.debug('uploading using url %s', upload_url)
-        # caller should guarantee sure no further change to the file
-        size = path.stat().st_size  
-        with path.open('rb') as f:
-            # https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob
-            request = urllib.request.Request(
-                url=upload_url, method="PUT", data=f, headers={
-                    'Content-Length': str(size),
-                    'Content-Type': 'application/octet-stream',
-                    'User-Agent': USER_AGENT,
-                    'Date': datetime.datetime.utcnow().strftime(
-                        '%a, %d %b %Y %H:%M:%S GMT'),
-                    'x-ms-version': '2023-11-03',
-                    'x-ms-blob-type': 'BlockBlob',
-                })
-            # we don't want loop to be blocked, therefore using thread pool.
-            await asyncio.get_running_loop().run_in_executor(
-                thread_pool, urlopen_worker, request, self.urlopen_options)
-
-
-class CopyUploader(Uploader):
-    def __init__(self, destdir):
-        destdir = Path(destdir)
-        if not destdir.is_dir():
-            raise RuntimeError(f'dest {destdir} not a directory')
-        self.destdir = destdir
-
-    async def upload(self, path):
-        if not path.is_file():
-            raise RuntimeError(f'path {path} is not a file')
-
-        await asyncio.get_running_loop().run_in_executor(
-            thread_pool, shutil.copyfile, path, self.destdir/path.name
-        )
-
-class Archiver(object):
-    """archives a directory into a file"""
-    async def archive(self, path):
-        pass
-
+    def upload_sync():
+        raise NotImplementedError
 
 
 class ArtifactManager(Task):
@@ -1111,11 +930,122 @@ class ArtifactManager(Task):
     basically, manager picks up artifact completion events, then
     archive -> upload the artifact. Marks artifact uploaded / failed accordingly
     """
-    def __init__(self, archiver, uploader, name='artifact-manager'):
+    def __init__(self, archiver, uploader, name='artifact-manager',):
         super().__init__(self, name)
-        self.receptors['']
+        self.receptors['artifact'] = QueueReceptor()
+        self.uploader = uploader
+        self.archiver = archiver
+        self.executor = ThreadPoolExecutor()
     # XXX: handle exceptions and retry. currently we mark artifact as failed
-    # def filter_event()
+
+    def filter_event(self, event):
+        return (event.get('kind') == 'artifact'
+                and event.get('topic') == 'complete')
+
+    async def process_artifact(self, artifact):
+        if not artifact.keep:
+            self.logger.info('skipping non-keep artifact %r', artifact)
+
+        dest_path = self.hq.datapath / 'archive'
+        loop = asyncio.get_running_loop()
+        fpath = await loop.run_in_executor(
+            self.executor, self.archiver, artifact.path, dest_path)
+        fpath = Path(fpath)
+        try:
+            try:
+                await self.uploader.upload_async(Path(fpath))
+            except NotImplementedError:
+                await loop.run_in_executor(
+                    self.executor, self.uploader.upload_sync, fpath)
+        except:
+            logger.exception('failed uploading')
+            raise
+        finally:
+            try:
+                fpath.unlink()
+            except:
+                logger.exception('failed removing file %s', fpath)
+
+    async def loop(self):
+        while True:
+            try:
+                event = await self.receptors['artifact'].get()
+            except asyncio.CancelledError:
+                return
+            artifact = event['artifact']
+            await self.process_artifact(artifact)
+
+    async def run_task(self, hq):
+        self.hq = hq
+        wait_exit_task = asyncio.create_task(self.wait_exit(),
+                                             name=f'{self.name}-wait-exit')
+        loop_task = asyncio.create_task(self.loop(), name=f'{self.name}-loop')
+        asyncio.wait([wait_exit_task, loop_task])
+
+
+class CopyUploader(Uploader):
+    """This uploader simply copies files as-is to destination"""
+    def __init__(self, destdir):
+        destdir = Path(destdir)
+        if not destdir.is_dir():
+            raise RuntimeError(f'dest {destdir} not a directory')
+        self.destdir = destdir
+
+    def upload_sync(self, path):
+        if not path.is_file():
+            raise RuntimeError(f'path {path} is not a file')
+
+        shutil.copyfile(path, self.destdir/path.name)
+
+
+@contextlib.contextmanager
+def preserving_tempfile(*args, **kwargs):
+    """keep tempfile if no exception"""
+    fd, fpath = tempfile.mkstemp(*args, **kwargs)
+    try:
+        yield fd, fpath
+    except:
+        logger.exception('got exception when writing archive, removing')
+        try:
+            os.remove(fpath)
+        except:
+            logger.exception('failed removing %r', fpath)
+        raise
+
+
+def archive_tar(datapath:str, outpath:str,
+                compressor:Literal[None,'gz','bz2','xz']='gz'):
+    import tarfile
+    suffix = '.tar'
+    tarmode = 'w'
+    if compressor:
+        suffix += '.' + compressor
+        tarmode += ':' + compressor
+    stack = contextlib.ExitStack()
+    with stack:
+        fd, fpath = stack.enter_context(
+            preserving_tempfile(dir=outpath, prefix='archive-', suffix=suffix))
+        f = stack.enter_context(open(fd, 'wb'))
+        tf = stack.enter_context(tarfile.open(fileobj=f, mode=tarmode))
+        tf.add(datapath)
+    return fpath
+
+
+def archive_zip(datapath:str, outpath:str, ):
+    import zipfile
+    stack = contextlib.ExitStack()
+    with stack:
+        fd, fpath = stack.enter_context(
+            preserving_tempfile(dir=outpath, prefix='archive-', suffix='.zip'))
+        f = stack.enter_context(open(fd, 'wb'))
+        zf = stack.enter_context(
+            zipfile.ZipFile(f, mode='w', compression=zipfile.ZIP_DEFLATED))
+        for dirpath, dirnames, filenames in os.walk(datapath):
+            print(f'walking {dirpath}')
+            for fn in filenames:
+                print(fn)
+                zf.write(os.path.join(dirpath, fn))
+    return fpath
 
 
 def main(hq):

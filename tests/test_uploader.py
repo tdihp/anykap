@@ -9,10 +9,11 @@ import sys
 from inspect import getsourcelines
 import ssl
 from anykap import *
+from anykap.azure import *
 
 try:
     from azure.storage.blob import (
-        BlobServiceClient, BlobClient, ContainerClient, generate_container_sas)
+        BlobServiceClient, generate_container_sas)
     has_azure_storage_blob = True
 except ImportError:
     has_azure_storage_blob = False
@@ -115,28 +116,8 @@ def ssl_context(blob_server_cert):
     context.load_verify_locations(cafile=cert_path)
     return context
 
-# def test_nothing(azurite, server_cert):
-#     import urllib.request
-#     import http.client
-#     # hack: this is required as python urllib/http.client doesn't support
-#     #       alternative name resolution
-#     with patch('socket.getaddrinfo') as mock_getaddrinfo:
-#         mock_getaddrinfo.return_value = [(
-#             socket.AF_INET,
-#             socket.SOCK_STREAM,
-#             socket.IPPROTO_TCP,
-#             '',
-#             ('127.0.0.1', 443)
-#         )]
-#         with urllib.request.urlopen('https://bing.com') as f:
-#             print(f.status)
-#             print(f.reason)
-#             print(f.read())
 
-#     assert False
-
-
-async def test_azureblob_upload_working(
+def test_azureblob_upload_working(
         blob_container, storage_account, azurite, tmp_path, ssl_context):
     server_name, server_ip, cert, blob_port, queue_port, table_port = azurite
     container_client, container_name, sas = blob_container
@@ -150,12 +131,12 @@ async def test_azureblob_upload_working(
         url=f'https://127.0.0.1:{blob_port}',
         urlopen_options={'context': ssl_context}
     )
-    await uploader.upload(blobfile,)
+    uploader.upload_sync(blobfile,)
     downloader = container_client.download_blob('blobdata_working')
     assert downloader.readall() == data
 
 
-async def test_azureblob_upload_container_notfound(
+def test_azureblob_upload_container_notfound(
         blob_container, storage_account, azurite, tmp_path, ssl_context):
     server_name, server_ip, cert, blob_port, queue_port, table_port = azurite
     container_client, container_name, sas = blob_container
@@ -170,8 +151,7 @@ async def test_azureblob_upload_container_notfound(
         urlopen_options={'context': ssl_context}
     )
     with pytest.raises(urllib.error.HTTPError):
-        await uploader.upload(blobfile)
-    # assert False
+        uploader.upload_sync(blobfile)
 
 
 def test_make_azureblob_url():
