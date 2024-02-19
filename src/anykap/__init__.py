@@ -20,16 +20,17 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
+# ------------------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------------------
 # XXX: make __all__
 __version__ = '0.1.0'
 USER_AGENT = f'anykap/{__version__}'
-
 logger = logging.getLogger('anykap')
 
 # ------------------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------------------
-
 NAME_PARSER = re.compile('^[a-z][a-z0-9_-]{0,254}$', flags=re.ASCII)
 
 def validate_name(name:str):
@@ -113,7 +114,8 @@ class Receptor(object):
         return self.get_nowait()
 
 class FutureReceptor(Receptor):
-    """ a future -> value receptor, only wait once, typical for exit receptor """
+    """ a future -> value receptor, only wait once,
+    typical for exit receptor """
     def __init__(self, initial_value=False):
         super().__init__()
         # self.future = asyncio.Future()
@@ -1013,38 +1015,42 @@ def preserving_tempfile(*args, **kwargs):
         raise
 
 
-def archive_tar(datapath:str, outpath:str,
-                compressor:Literal[None,'gz','bz2','xz']='gz'):
+def archive_tar(datapath:str, outpath:str, basedir:str=None, compressor='gz',
+                **kwargs):
     import tarfile
     suffix = '.tar'
     tarmode = 'w'
+    if not compressor in (None, 'gz', 'bz2', 'xz'):
+        raise ValueError(f'invalid compressor {compressor!r}')
     if compressor:
         suffix += '.' + compressor
         tarmode += ':' + compressor
+    basedir = basedir or os.path.basename(datapath)
     stack = contextlib.ExitStack()
     with stack:
         fd, fpath = stack.enter_context(
             preserving_tempfile(dir=outpath, prefix='archive-', suffix=suffix))
         f = stack.enter_context(open(fd, 'wb'))
-        tf = stack.enter_context(tarfile.open(fileobj=f, mode=tarmode))
-        tf.add(datapath)
+        tf = stack.enter_context(
+            tarfile.open(fileobj=f, mode=tarmode, **kwargs))
+        tf.add(datapath, basedir)
     return fpath
 
 
-def archive_zip(datapath:str, outpath:str, ):
+def archive_zip(datapath:str, outpath:str, basedir:str=None, **kwargs):
     import zipfile
+    basedir = basedir or os.path.basename(datapath)
     stack = contextlib.ExitStack()
     with stack:
         fd, fpath = stack.enter_context(
             preserving_tempfile(dir=outpath, prefix='archive-', suffix='.zip'))
         f = stack.enter_context(open(fd, 'wb'))
         zf = stack.enter_context(
-            zipfile.ZipFile(f, mode='w', compression=zipfile.ZIP_DEFLATED))
+            zipfile.ZipFile(f, mode='w', **kwargs))
         for dirpath, dirnames, filenames in os.walk(datapath):
-            print(f'walking {dirpath}')
+            relpath = os.path.relpath(dirpath, datapath)
             for fn in filenames:
-                print(fn)
-                zf.write(os.path.join(dirpath, fn))
+                zf.write(os.path.join(dirpath, fn), os.path.join(basedir, relpath, fn))
     return fpath
 
 
