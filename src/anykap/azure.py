@@ -144,12 +144,12 @@ class AzureBlobUploader(Uploader):
         self.blob_options = kwargs
         self.urlopen_options = urlopen_options or {}
 
-    def upload_sync(self, path):
+    def upload_sync(self, path, name):
         path = Path(path)
         if not path.is_file():
             raise RuntimeError(f'path {path} not a file')
 
-        upload_url = azureblob_make_url(path.name, **self.blob_options)
+        upload_url = azureblob_make_url(name, **self.blob_options)
         logger.debug('uploading using url %s', upload_url)
         # caller should guarantee sure no further change to the file
         size = path.stat().st_size  
@@ -167,3 +167,4 @@ class AzureBlobUploader(Uploader):
                 })
             # we don't want loop to be blocked, therefore using thread pool.
             urlopen_worker(request, self.urlopen_options)
+        return upload_url.split('?', 1)[0]  # we skip queries for the result

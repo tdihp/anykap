@@ -6,7 +6,7 @@ import random
 import signal
 from unittest.mock import Mock, patch
 import sys
-from inspect import getsourcelines
+from inspect import getsource
 import ssl
 from anykap import *
 from anykap.azure import *
@@ -109,6 +109,7 @@ def blob_container(azurite, shared_key, storage_account):
         with container_client:
             yield container_client, container_name, sas
 
+
 @pytest.fixture
 def ssl_context(blob_server_cert):
     server_name, cert_path, key_path = blob_server_cert
@@ -122,8 +123,8 @@ def test_azureblob_upload_working(
     server_name, server_ip, cert, blob_port, queue_port, table_port = azurite
     container_client, container_name, sas = blob_container
     blobfile = tmp_path / 'blobdata_working'
-    lines, _ = getsourcelines(sys.modules[__name__])
-    data = ''.join(lines).encode('utf-8')
+    outname = 'output.data'
+    data = getsource(sys.modules[__name__]).encode()
     # print(f'lines: {lines}')
     blobfile.write_bytes(data)
     uploader = AzureBlobUploader(
@@ -131,9 +132,10 @@ def test_azureblob_upload_working(
         url=f'https://127.0.0.1:{blob_port}',
         urlopen_options={'context': ssl_context}
     )
-    uploader.upload_sync(blobfile,)
-    downloader = container_client.download_blob('blobdata_working')
+    result = uploader.upload_sync(blobfile, outname)
+    downloader = container_client.download_blob(outname)
     assert downloader.readall() == data
+    assert result == f'https://127.0.0.1:{blob_port}/{storage_account}/{container_name}/{outname}'
 
 
 def test_azureblob_upload_container_notfound(
@@ -142,8 +144,8 @@ def test_azureblob_upload_container_notfound(
     container_client, container_name, sas = blob_container
     another_container = 'yetanothercontainer'
     blobfile = tmp_path / 'blobdata_notfound'
-    lines, _ = getsourcelines(sys.modules[__name__])
-    blobfile.write_text(''.join(lines))
+    data = getsource(sys.modules[__name__])
+    blobfile.write_text(data)
 
     uploader = AzureBlobUploader(
         account=storage_account, container=another_container, sas=sas,
@@ -151,7 +153,7 @@ def test_azureblob_upload_container_notfound(
         urlopen_options={'context': ssl_context}
     )
     with pytest.raises(urllib.error.HTTPError):
-        uploader.upload_sync(blobfile)
+        uploader.upload_sync(blobfile, 'output.data')
 
 
 def test_make_azureblob_url():
@@ -188,6 +190,16 @@ def test_make_azureblob_url():
             url='foobar.blob.core.windows.net',
             container='mycontainer',
             )
-    
 
 
+def test_copy_uploader(tmp_path):
+    data = getsource(sys.modules[__name__]).encode()
+    srcpath = tmp_path / 'src'
+    dstpath = tmp_path / 'dst'
+    dstpath.mkdir()
+    outname = 'foobar.data'
+    srcpath.write_bytes(data)
+    uploader = CopyUploader(dstpath)
+    result = uploader.upload_sync(srcpath, outname)
+    assert (dstpath / outname).read_bytes() == data
+    assert result.removeprefix('file://') == str(dstpath / outname)

@@ -167,7 +167,7 @@ class QueueReceptor(Receptor):
         return event
 
     async def get(self):
-        return self.queue.get()
+        return await self.queue.get()
 
 
 class Artifact(object):
@@ -193,6 +193,17 @@ class Artifact(object):
     def mark_state(self, state):
         self.state = state
         self.milestones[state] = datetime.datetime.utcnow()
+
+    def mark_upload_state(self, state):
+        self.upload_state = state
+        self.milestones[state] = datetime.datetime.utcnow()
+
+    def upload_complete(self, upload_url):
+        self.upload_url = upload_url
+        self.mark_upload_state('completed')
+        self.hq.send_event({'kind': 'artifact',
+                            'topic': 'uploaded',
+                            'artifact': self})  # for user to find context
 
     def start(self):
         assert self.state == 'created'
@@ -426,7 +437,7 @@ class HQ(object):
 
     def new_artifact(self, name, keep=True, context=None):
         artifact_name = self.gen_artifact_name(name)
-        path = self.datapath / name
+        path = self.datapath / artifact_name
         if path.exists():
             raise RuntimeError('artifact path %s already exists' % path)
 
@@ -920,10 +931,10 @@ class Uploader(object):
     """uploader interface. Uploader should eitehr implement the async or the
     sync version"""
 
-    async def upload_async(path:Path):
+    async def upload_async(self, path:Path, name:str):
         raise NotImplementedError
 
-    def upload_sync():
+    def upload_sync(self, path:Path, name:str):
         raise NotImplementedError
 
 
@@ -933,8 +944,9 @@ class ArtifactManager(Task):
     archive -> upload the artifact. Marks artifact uploaded / failed accordingly
     """
     def __init__(self, archiver, uploader, name='artifact-manager',):
-        super().__init__(self, name)
+        super().__init__(name)
         self.receptors['artifact'] = QueueReceptor()
+        self.receptors['artifact'].add_condition(self.filter_event)
         self.uploader = uploader
         self.archiver = archiver
         self.executor = ThreadPoolExecutor()
@@ -947,26 +959,38 @@ class ArtifactManager(Task):
     async def process_artifact(self, artifact):
         if not artifact.keep:
             self.logger.info('skipping non-keep artifact %r', artifact)
-
+        artifact.mark_upload_state('archiving')
         dest_path = self.hq.datapath / 'archive'
+        dest_path.mkdir(exist_ok=True, parents=True)
         loop = asyncio.get_running_loop()
-        fpath = await loop.run_in_executor(
-            self.executor, self.archiver, artifact.path, dest_path)
+        try:
+            self.logger.debug(
+                'calling archiver: %s %s %s %s',
+                self.executor, self.archiver, artifact.path, dest_path)
+            fpath = await loop.run_in_executor(
+                self.executor, self.archiver, artifact.path, dest_path)
+        except:
+            artifact.mark_upload_state('failed')
+            raise
         fpath = Path(fpath)
+        destname = fpath.with_stem(artifact.name).name
+        artifact.mark_upload_state('uploading')
         try:
             try:
-                await self.uploader.upload_async(Path(fpath))
+                result = await self.uploader.upload_async(fpath, destname)
             except NotImplementedError:
-                await loop.run_in_executor(
-                    self.executor, self.uploader.upload_sync, fpath)
+                result = await loop.run_in_executor(
+                    self.executor, self.uploader.upload_sync, fpath, destname)
         except:
-            logger.exception('failed uploading')
+            # logger.exception('failed uploading')
+            artifact.mark_upload_state('failed')
             raise
         finally:
             try:
                 fpath.unlink()
             except:
                 logger.exception('failed removing file %s', fpath)
+        artifact.upload_complete(str(result))
 
     async def loop(self):
         while True:
@@ -974,30 +998,37 @@ class ArtifactManager(Task):
                 event = await self.receptors['artifact'].get()
             except asyncio.CancelledError:
                 return
+                
             artifact = event['artifact']
-            await self.process_artifact(artifact)
+            try:
+                await self.process_artifact(artifact)
+            # except asyncio.CancelledError: # XXX try finish upload?
+            except:
+                logger.exception('processing artifact failed')
 
     async def run_task(self, hq):
         self.hq = hq
-        wait_exit_task = asyncio.create_task(self.wait_exit(),
-                                             name=f'{self.name}-wait-exit')
         loop_task = asyncio.create_task(self.loop(), name=f'{self.name}-loop')
-        asyncio.wait([wait_exit_task, loop_task])
+        await self.wait_exit()
+        loop_task.cancel()
+        await asyncio.wait([loop_task])
 
 
 class CopyUploader(Uploader):
-    """This uploader simply copies files as-is to destination"""
+    """This uploader simply copies files as-is to destination
+    useful for copying to volumes"""
     def __init__(self, destdir):
         destdir = Path(destdir)
         if not destdir.is_dir():
             raise RuntimeError(f'dest {destdir} not a directory')
         self.destdir = destdir
 
-    def upload_sync(self, path):
+    def upload_sync(self, path, name):
         if not path.is_file():
             raise RuntimeError(f'path {path} is not a file')
-
-        shutil.copyfile(path, self.destdir/path.name)
+        abspath = (self.destdir/name).absolute()
+        shutil.copyfile(path, abspath)
+        return 'file://' + str(abspath)
 
 
 @contextlib.contextmanager
