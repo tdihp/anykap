@@ -6,4 +6,6 @@ hq = HQ(datapath="/var/lib/anykap/{name}")
 hq.add_task(HQREPLServer(path="/var/run/anykap-{name}.sock"))
 
 # add your capturing tasks/rules here
-main(hq)
+
+if __name__ == '__main__':
+    main(hq)

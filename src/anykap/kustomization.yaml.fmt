@@ -1,3 +1,11 @@
+metadata:
+  # kubectl-anykap uses kustomize.metadata.annotations to provide extra settings
+  annotations:
+    # used to locate hq datapath and replserver unix socket
+    anykap/name: "{name}"
+    # modify this if need to chroot to a different path
+    # if empty or not provided, means chroot is not necessary
+    anykap/chroot: "/host"
 resources:
 - daemonset.yaml
 commonLabels:
@@ -9,3 +17,4 @@ configMapGenerator:
   files:
 {cmfiles}
 namePrefix: "{name}-"
+# namespace: # specify a namespace if preferred

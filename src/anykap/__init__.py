@@ -1086,4 +1086,5 @@ def archive_zip(datapath:str, outpath:str, basedir:str=None, **kwargs):
 
 
 def main(hq):
+    logging.basicConfig(level=logging.DEBUG)
     asyncio.run(hq.run())
