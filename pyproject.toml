@@ -20,7 +20,7 @@ testpaths = [
     "tests",
 ]
 
-[project.gui-scripts]
+[project.scripts]
 kubectl-anykap = "anykap.client:main"
 
 [tool.hatch]
