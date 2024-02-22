@@ -21,6 +21,10 @@ Install dependencies
     python -m pip install -U pip
     pip install pytest pytest-cov pytest-asyncio 
 
+Install anykap for local development
+
+    pip install -e .
+
 For testing Azure blob, 
 [install azurite](https://github.com/Azure/Azurite?tab=readme-ov-file#npm) and
 azure-storage-blob
