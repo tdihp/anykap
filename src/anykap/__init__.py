@@ -306,7 +306,7 @@ class Task(_TaskBase):
         return hq.send_event(event)
 
     def new_artifact(self, hq, name=None, keep=True):
-        return hq.new_artifact(name or self.name, keep) 
+        return hq.new_artifact(name or self.name, keep, context=self)
 
     def start(self, hq):
         # copying from threading.Thread
@@ -821,6 +821,7 @@ class REPLServer(Task):
 
 class HQREPLServer(REPLServer):
     TASK_KEYS = ['name', 'running', 'exiting']
+    ARTIFACT_KEYS = ['name', 'state', 'path', 'upload_state', 'upload_url']
 
     def __init__(self, path='repl.sock', *args, **kwargs):
         super().__init__(path, *args, **kwargs)
@@ -831,8 +832,7 @@ class HQREPLServer(REPLServer):
         tasks = subparsers.add_parser(
             'tasks', aliases=['t', 'task'], help='task management')
         tasks.set_defaults(func=self.cmd_tasks)
-        tasks.add_argument('-s', '--stop', default='list',
-                           dest='verb', action='store_const', const='stop',
+        tasks.add_argument('-s', '--stop', action='store_true',
                            help='stop tasks if provided, otherwise list tasks')
         tasks.add_argument('-r', '--regex', action='store_true',
                            help='filter task name with regular expression')
@@ -842,7 +842,9 @@ class HQREPLServer(REPLServer):
                            help='task name or pattern, must exist for stop')
         artifacts = subparsers.add_parser(
             'artifacts', aliases=['a', 'artifact'], help='artifact management')
+        
         artifacts.set_defaults(func=self.cmd_artifacts)
+        # artifacts.add_argument('', help='')
         send = subparsers.add_parser('send', help='send a event to hq')
         send.add_argument('event', type=json.loads, help='event in json')
         send.set_defaults(func=self.cmd_send)
@@ -859,10 +861,10 @@ class HQREPLServer(REPLServer):
         return args.func(args)
 
     def cmd_tasks(self, args):
-        if not args.name and args.verb == 'stop':
+        if not args.name and args.stop:
             self.parser.error('task name must exist for stop')
         tasks = list(self.hq.tasks)
-        if args.all and args.verb == 'list':
+        if args.all and not args.stop:
             tasks += self.hq.done_tasks
         else:
             tasks = list(task for task in tasks if task.running)
@@ -875,7 +877,7 @@ class HQREPLServer(REPLServer):
                                     for pattern in patterns))
             else:
                 tasks = [task for task in tasks if task.name in args.name]
-        if args.verb == 'stop':
+        if args.stop:
             tasks = list(task for task in tasks if not task.need_exit())
             for task in tasks:
                 task.exit()
@@ -886,7 +888,11 @@ class HQREPLServer(REPLServer):
         return result
 
     def cmd_artifacts(self, args):
-        return []
+        artifacts = list(self.hq.artifacts)
+        result = ['\t'.join(self.ARTIFACT_KEYS)]
+        result.extend('\t'.join(str(d.get(k, '')) for k in self.ARTIFACT_KEYS)
+                      for d in map(asdict, artifacts))
+        return result
 
     def cmd_send(self, args):
         event = args.event
@@ -972,7 +978,7 @@ class ArtifactManager(Task):
                 event = await self.receptors['artifact'].get()
             except asyncio.CancelledError:
                 return
-                
+
             artifact = event['artifact']
             try:
                 await self.process_artifact(artifact)

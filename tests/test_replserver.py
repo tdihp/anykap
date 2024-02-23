@@ -145,3 +145,33 @@ def test_send(hq, hqthread, hqreplserver):
     result = q.get(timeout=3)
     assert result['data'] == 'foobar'
 
+
+def test_artifacts(hq, hqthread, hqreplserver):
+    hq.add_task(hqreplserver)
+    # a new artifact
+    a1 = hq.new_artifact('foobar1')
+    # a completed artifact
+    a2 = hq.new_artifact('foobar2')
+    a2.start()
+    a2.complete()
+    # a uploaded artifact
+    a3 = hq.new_artifact('foobar3')
+    a3.start()
+    a3.complete()
+    a3.upload_complete('testlocation://foobar3')
+    hqthread.start()
+    with contextlib.closing(REPLClient(hqreplserver.path)) as replclient:
+        result = replclient.query('artifacts')
+    print(result)
+    assert result[0] == 'OK'
+    assert result[1] == 'name\tstate\tpath\tupload_state\tupload_url'
+    rows = [line.split('\t') for line in result[2:]]
+    assert len(rows) == 3
+    d = dict((row[0], row) for row in rows)
+    _, state, path, upload_state, upload_url = d[a1.name]
+    assert state == 'created' and path == str(a1.path)
+    _, state, path, upload_state, upload_url = d[a2.name]
+    assert state == 'completed' and path == str(a2.path)
+    _, state, path, upload_state, upload_url = d[a3.name]
+    assert state == 'completed' and upload_state == 'completed'
+    assert upload_url == 'testlocation://foobar3'
