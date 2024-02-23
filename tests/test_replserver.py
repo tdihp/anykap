@@ -127,7 +127,8 @@ def test_tasks(hq, hqthread, hqreplserver):
     hq.add_task(hqreplserver)
     hqthread.start()
     with contextlib.closing(REPLClient(hqreplserver.path)) as replclient:
-        assert replclient.query('tasks') == ['OK', 'replserver\tTrue\tFalse']
+        assert replclient.query('tasks') == \
+            ['OK',  'name\trunning\texiting', 'replserver\tTrue\tFalse']
 
 
 def test_send(hq, hqthread, hqreplserver):

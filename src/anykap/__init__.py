@@ -1,8 +1,6 @@
 from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal, NewType
-import abc
-# import dataclasses
-from dataclasses import dataclass, field, make_dataclass
+from dataclasses import dataclass, field, make_dataclass, asdict
 from collections import defaultdict
 import os
 from pathlib import Path
@@ -822,6 +820,8 @@ class REPLServer(Task):
 
 
 class HQREPLServer(REPLServer):
+    TASK_KEYS = ['name', 'running', 'exiting']
+
     def __init__(self, path='repl.sock', *args, **kwargs):
         super().__init__(path, *args, **kwargs)
         parser = REPLArgumentParser(prog=self.name)
@@ -859,40 +859,31 @@ class HQREPLServer(REPLServer):
         return args.func(args)
 
     def cmd_tasks(self, args):
-        verb = args.verb
-        name = args.name
-        regex = args.regex
-        if not name and verb == 'stop':
+        if not args.name and args.verb == 'stop':
             self.parser.error('task name must exist for stop')
         tasks = list(self.hq.tasks)
-        if all and verb == 'list':
+        if args.all and args.verb == 'list':
             tasks += self.hq.done_tasks
         else:
             tasks = list(task for task in tasks if task.running)
 
-        if name:
-            if regex:
-                patterns = list(map(re.compile, name))
+        if args.name:
+            if args.regex:
+                patterns = list(map(re.compile, args.name))
                 tasks = list(task for task in tasks
                              if any(pattern.search(task.name)
                                     for pattern in patterns))
             else:
-                tasks = [task for task in tasks if task.name in name]
-        if verb == 'list':
-            return list(map(self.format_task_tsv, tasks))
-        else:
-            assert verb == 'stop'
+                tasks = [task for task in tasks if task.name in args.name]
+        if args.verb == 'stop':
             tasks = list(task for task in tasks if not task.need_exit())
             for task in tasks:
                 task.exit()
-            return list(map(self.format_task_tsv, tasks))
 
-    def format_task_tsv(self, task):
-        running = task.running
-        stopping = False
-        if running:
-            stopping = task.need_exit()
-        return '\t'.join([task.name, str(running), str(stopping)])
+        result = ['\t'.join(self.TASK_KEYS)]
+        result.extend('\t'.join(str(d.get(k, '')) for k in self.TASK_KEYS)
+                      for d in map(asdict, tasks))
+        return result
 
     def cmd_artifacts(self, args):
         return []
