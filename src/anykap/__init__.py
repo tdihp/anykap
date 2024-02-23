@@ -1,5 +1,9 @@
 from collections.abc import Callable
-from typing import Optional, Any, Type, Union, Literal
+from typing import Optional, Any, Type, Union, Literal, NewType
+import abc
+# import dataclasses
+from dataclasses import dataclass, field, make_dataclass
+from collections import defaultdict
 import os
 from pathlib import Path
 import itertools as it
@@ -48,28 +52,32 @@ def sanitize_name(name:str):
     """
     Try to sanitize the given name so it can be a valid one.
     """
-    return re.sub(r'^[a-z0-9_-]', '',
+    return re.sub(r'[^a-z0-9_-]', '',
                   re.sub(r'\s+', '_', name.strip().lower())).strip('_-')[:255]
 
 
 # -------------
 # Core Concepts
 # -------------
+Event=NewType('Event', dict)
+EventProcessor=NewType('EventProcessor', Callable[[Event], None])
+EventFilter=NewType('EventFilter', Callable[[Event], bool])
+EventMutator=NewType('EventMutator', Callable[[Event], Any])
 
-class Receptor(object):
+@dataclass(init=False, eq=False)
+class Receptor:
     """
-    Receptor is a part of the event driven framework that defines subscription
-    to the event stream.
-    
-    Filters can be added to decide whether the testing event is subscribed.
+    Receptor is a EventProcessor with a list of conditions.
+    Conditions can be added to decide whether the testing event is subscribed.
     """
+    conditions:list[tuple[EventFilter, Optional[EventMutator]]]
     def __init__(self):
         self.conditions = []
         self.logger = logger.getChild(self.__class__.__name__)
 
     def add_condition(self,
-                      filter_:Callable[["dict"], bool],
-                      mutator:Optional[Callable[["dict"], Any]]=None,
+                      filter_:EventFilter,
+                      mutator:Optional[EventMutator]=None,
                       ):
         if not callable(filter_):
             raise ValueError(f'provided filter {filter_!r} not callable')
@@ -170,24 +178,24 @@ class QueueReceptor(Receptor):
         return await self.queue.get()
 
 
-class Artifact(object):
+@dataclass
+class Artifact:
     """metadata for artifact"""
-    hq:"HQ" = None
-    def __init__(self, name:str, path:Path, keep=True, context:Any=None):
-        """keep is a hint on whether we intend to keep it.
-        Some commands might just need a working dir for artifact.
-        """
-        self.name = name
-        self.path = path
-        self.loggers = []
-        self.handler = None
-        self.keep = True
-        self.context = context
-        self.upload_state = None  # None / 'uploading' / 'complete'
-        self.upload_attempts = 0
-        self.last_upload_failure = None
-        self.upload_url = None # a path metadata for human comsumption
-        self.milestones = {}
+    # metadata
+    name:str
+    path:Path
+    keep:bool = True
+    context:Any = None
+    milestones:dict[str, datetime.datetime] = field(default_factory=dict)
+    # lifecycle
+    state:str = 'created'
+    upload_state:Optional[str] = None
+    upload_attempts:int = 0
+    last_upload_failure:Optional[Exception] = None
+    upload_url:Optional[str] = None
+
+    def __post_init__(self):
+        self.hq = None
         self.mark_state('created')
 
     def mark_state(self, state):
@@ -208,21 +216,18 @@ class Artifact(object):
     def start(self):
         assert self.state == 'created'
         self.mark_state('started')
-
-        for logger in self.loggers:
-            logger.addHandler(self.handler)
+        # for logger in self.loggers:
+        #     logger.addHandler(self.handler)
 
     def complete(self):
         assert self.state == 'started', "got state %s" % self.state
         self.mark_state('completed')
-        for logger in self.loggers:
-            logger.removeHandler(self.handler)
-
+        # for logger in self.loggers:
+        #     logger.removeHandler(self.handler)
         self.hq.send_event({'kind': 'artifact',
                             'topic': 'complete',
-                            'artifact': self})  # for user to find context
-        # we don't handle keep here, but other components might decide on how
-        # to deal with it
+                            'artifact': self,
+                            })  # for user to find context
 
     def destroy(self):
         assert self.state == 'completed'
@@ -236,29 +241,45 @@ class Artifact(object):
         self.complete()
 
 
-class Task(object):
-    # each task can have fixed number of receptors. They should be defined like
-    # this:
-    # Noting a exit receptor always exists and HQ expects that
-    receptors:dict[str, Receptor]
+task_dataclass = dataclass(eq=False, unsafe_hash=False)
 
-    # The exit receptor should be checked by run function to check whether to
-    # terminate itself immediately
-    receptor_exit = FutureReceptor
+_TaskBase = make_dataclass('Task', [
+        ('name', Optional[str], None),
+        ('receptors', dict[str, Receptor], field(init=False)),
+        ('running', bool, field(init=False)),
+        ('exiting', bool, field(init=False)),
+    ], eq=False, unsafe_hash=False,
+    namespace={'__post_init__': lambda self: None},
+)
 
-    def __init__(self, name:str):
-        if not validate_name(name):
+class Task(_TaskBase):
+    counterdict = defaultdict(it.count)
+    def __post_init__(self):
+        super().__post_init__()
+        if self.name is None:
+            clsname = sanitize_name(self.__class__.__name__)
+            id_ = next(self.counterdict[clsname])
+            self.name = f'{clsname}-{id_}'
+
+        if not validate_name(self.name):
             raise ValueError(
-                f"given name {name} is not valid, please sanitize first")
-        self.name = name
-        # every attr with prefix "receptor_" will be taken as a receptor
-        self.receptors = dict((k.split('_', 1)[1], getattr(self, k)())
-                              for k in dir(self)
-                              if k.startswith('receptor_'))
-        # XXX: we are assuming name is unique
+                f"given name {self.name} is not valid, please sanitize first")
+
+        # each task can have fixed number of receptors to subscribe events
+        self.receptors = {'exit': FutureReceptor()}
+
         self.logger = logger.getChild(
             self.__class__.__name__).getChild(self.name)
-        self.task = None
+
+        self._task = None
+
+    @property
+    def running(self):
+        return bool(self._task) and not self._task.done()
+
+    @property
+    def exiting(self):
+        return self.running and self.need_exit()
 
     def exit(self):
         """intended method to directly terminate this task"""
@@ -291,28 +312,14 @@ class Task(object):
 
     def start(self, hq):
         # copying from threading.Thread
-        self.task = asyncio.create_task(self.run(hq), name=self.name)
+        if self._task:
+            raise RuntimeError('start called twice')
+        self._task = asyncio.create_task(self.run(hq), name=self.name)
 
     async def join(self):
         # only call this after start
-        if self.task and not self.task.done():
-            await self.task
-
-    def is_alive(self):
-        if self.task:
-            return not (self.task.done() or self.task.cancelled())
-
-    def __hash__(self):
-        return hash(self.name)  # Task names should be unique
-
-    def __eq__(self, other):
-        if not isinstance(other, Task):
-            raise ValueError(f'task comparing with nontask {other!r}')
-        return self.name == other.name
-
-    def __repr__(self):
-        return f'{self.__class__.__name__}(name={self.name})'
-
+        if self._task and not self._task.done():
+            await self._task
 
 class HQ(object):
     """
@@ -353,7 +360,7 @@ class HQ(object):
         await self._quit
         waits = []
         for task in self.tasks:
-            if task.is_alive():
+            if task.running:
                 task.exit()
                 waits.append(asyncio.create_task(task.join(), name=f'wait-for-task-{task.name}'))
         # raise Exception('oops')
@@ -375,7 +382,6 @@ class HQ(object):
     async def loop(self):
         """execute event processing logic for one loop"""
         # we block only the the first one
-        # get_args = {'block': True, 'timeout': self.CADENCE}  
         logger = self.logger
         while self.running:
             try:
@@ -391,7 +397,7 @@ class HQ(object):
 
     def process_event(self, event):
         for task in self.tasks:
-            if not task.is_alive():
+            if not task.running:
                 self.tasks.remove(task)
                 self.done_tasks.append(task)
                 continue
@@ -461,6 +467,7 @@ class HQ(object):
 # Scenarios
 # ------------------------------------------------------------------------------
 
+@task_dataclass
 class ShellTask(Task):
     """run shell scripts
     
@@ -476,59 +483,29 @@ class ShellTask(Task):
     Since we should be dealing with text here, all subprocess.Popen parameters
     are set to prefer text parsing, and regex only supports text.
     """
-    STDOUT_FILE = 'sh.stdout'
-    STDERR_FILE = 'sh.stderr'
-    RESULT_FILE = 'sh.result'
-    # SIGTERM_TIMEOUT = 5
-    SIGKILL_TIMEOUT = 1
-    CADENCE = 0.2
+    script:str = ''
+    nsenter_args:Optional[list[str]] = None
+    shell:str = 'bash'
+    shell_args:Optional[float] = None
+    timeout:Optional[float] = None
+    keep_artifact:bool = True
+    encoding:str = 'utf-8'
+    errors:str = 'replace'
+    stdout_mode:Literal['artifact','notify','null'] = 'artifact'
+    stderr_mode:Literal['artifact','notify','null','stdout'] = 'artifact'
+    stdout_filter:Optional[str]=None
+    stderr_filter:Optional[str]=None
+    stdout_file:str = 'sh.stdout'
+    stderr_file:str = 'sh.stderr'
+    result_file:str = 'sh.result'
+    terminate_timeout:float = 5
+    kill_timeout:float = 1
+    popen_kw:dict[str, Any] = field(default_factory=dict)
 
-    def __init__(self,
-                 name,
-                 command:str,
-                 nsenter_args:Optional[list[str]]=None,
-                 shell:str='bash',
-                 shell_args:Optional[list[str]]=None,
-                 timeout:Optional[float]=None,
-                 keep_artifact:bool=True,
-                 encoding='utf-8',
-                 errors='replace',
-                 stdout_mode:Literal['artifact','notify','null']='artifact',
-                 stderr_mode:Literal['artifact','notify','null','stdout']='artifact',
-                 stdout_filter:Optional[Union[str,re.Pattern[str]]]=None,
-                 stderr_filter:Optional[Union[str,re.Pattern[str]]]=None,
-                 terminate_timeout=5,
-                 **kwargs,
-                 ):
-        super().__init__(name)
-        self.command = command
-        self.shell = shell
-        self.shell_args = shell_args or []
-        self.nsenter_args = nsenter_args
-        self.timeout = timeout
-        self.keep_artifact = keep_artifact
-        self.encoding = encoding
-        self.errors = errors
-        self.stdout_mode = stdout_mode
-        self.stderr_mode = stderr_mode
-        self.terminate_timeout = terminate_timeout
-
-        if stdout_filter:
-            if isinstance(stdout_filter, str):
-                logger.debug('compiling stdout filter %r', stdout_filter)
-                stdout_filter = re.compile(stdout_filter)
-            elif not isinstance(stdout_filter, re.Pattern):
-                raise ValueError('provided stdout_filter %r is not valid'
-                                 % stdout_filter)
-        self.stdout_filter = stdout_filter
-        if stderr_filter:
-            if isinstance(stderr_filter, str):
-                logger.debug('compiling stderr filter %r', stderr_filter)
-                stderr_filter = re.compile(stderr_filter)
-            elif not isinstance(stdout_filter, re.Pattern):
-                raise ValueError('provided stderr_filter %r is not valid'
-                                 % stderr_filter)
-        self.stderr_filter = stderr_filter
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.script:
+            raise ValueError('script is not provided')
 
     async def run_task(self, hq):
         logger = self.logger
@@ -536,7 +513,7 @@ class ShellTask(Task):
         if self.shell_args:
             args.extend(self.shell_args)
 
-        args += ['-c', self.command]
+        args += ['-c', self.script]
 
         if self.nsenter_args:
             args[0:0] = ['nsenter'] + self.nsenter_args
@@ -559,8 +536,8 @@ class ShellTask(Task):
                     return async_subproc.PIPE
                 raise ValueError(f'unrecognized mode {mode!r}')
 
-            stdout = prepare_file(self.stdout_mode, self.STDOUT_FILE)
-            stderr = prepare_file(self.stderr_mode, self.STDERR_FILE)
+            stdout = prepare_file(self.stdout_mode, self.stdout_file)
+            stderr = prepare_file(self.stderr_mode, self.stderr_file)
             p = await async_subproc.create_subprocess_exec(
                 *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
@@ -601,7 +578,7 @@ class ShellTask(Task):
             logger.info(f'script exit code: {result!r}')
             if notify_tasks:
                 await asyncio.wait(notify_tasks)
-            (artifact.path / self.RESULT_FILE).write_text(str(result))
+            (artifact.path / self.result_file).write_text(str(result))
             self.send_event(hq, 
                 {
                     'kind': 'shell',
@@ -611,6 +588,8 @@ class ShellTask(Task):
                 })
 
     async def notify_output(self, hq, stream, pattern, name):
+        if pattern:
+            pattern = re.compile(pattern)
         while not stream.at_eof():
             line = await stream.readline()
             if not line:  # potential EOF emptiness
@@ -645,7 +624,7 @@ class ShellTask(Task):
 
         p.kill()
         try:
-            await asyncio.wait_for(p.wait(), timeout=self.SIGKILL_TIMEOUT)
+            await asyncio.wait_for(p.wait(), timeout=self.kill_timeout)
             return
         except asyncio.TimeoutError:
             self.logger.error('killing process timed out, giving up')
@@ -889,7 +868,7 @@ class HQREPLServer(REPLServer):
         if all and verb == 'list':
             tasks += self.hq.done_tasks
         else:
-            tasks = list(task for task in tasks if task.is_alive())
+            tasks = list(task for task in tasks if task.running)
 
         if name:
             if regex:
@@ -909,7 +888,7 @@ class HQREPLServer(REPLServer):
             return list(map(self.format_task_tsv, tasks))
 
     def format_task_tsv(self, task):
-        running = task.is_alive()
+        running = task.running
         stopping = False
         if running:
             stopping = task.need_exit()
@@ -938,13 +917,17 @@ class Uploader(object):
         raise NotImplementedError
 
 
+# @task_dataclass
 class ArtifactManager(Task):
     """upload manager is a optional rule that handles archiving and uploading
     basically, manager picks up artifact completion events, then
     archive -> upload the artifact. Marks artifact uploaded / failed accordingly
     """
+    # uploader:Uploader = None
+    # archiver:Callable[[Path], None] = None
+    # def __post_init__
     def __init__(self, archiver, uploader, name='artifact-manager',):
-        super().__init__(name)
+        super().__init__(name=name)
         self.receptors['artifact'] = QueueReceptor()
         self.receptors['artifact'].add_condition(self.filter_event)
         self.uploader = uploader

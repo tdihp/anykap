@@ -10,7 +10,7 @@ async def test_shelltask_simple(hq, hqtask):
             result.set_result(event['topic'] == 'complete' and event['status'] == 42)
 
     hq.add_rule(myrule)
-    hq.add_task(ShellTask('foobar', 'echo "FooBar!"; exit 42'))
+    hq.add_task(ShellTask(name='foobar', script='echo "FooBar!"; exit 42'))
     await asyncio.wait_for(result, timeout=3)
     assert result.result
     # we verify artifacts are there
@@ -28,8 +28,8 @@ async def test_shelltask_notify(hq, hqtask):
 
     hq.add_rule(myrule)
     outnotify = ShellTask(
-        'foobarnotify',
-        r'''
+        name='foobarnotify',
+        script=r'''
         echo "should ignore" >&2
         echo "FooBar!"
         exit 42
