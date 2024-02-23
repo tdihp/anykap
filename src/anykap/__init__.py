@@ -334,7 +334,7 @@ class HQ(object):
         self.rules = []
         datapath = datapath or os.environ.get('ANYKAP_PATH', os.getcwd())
         self.datapath = Path(datapath).absolute()
-        # self.datapath.mkdir(parents=True, exist_ok=True)
+        logger.info('hq datapath: %s', self.datapath)
         if not self.datapath.is_dir():
             logger.warning('supplied datapath for hq %s not a directory',
                            self.datapath)

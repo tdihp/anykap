@@ -88,6 +88,8 @@ def azureblob_make_url(filename:str, url=None, scheme=None, account=None,
 
         if parsed.fragment or parsed.params:
             raise ValueError(f'unrecognizable url {url}')
+        if parsed.query:
+            set_config('sas', parsed.query)
         path = [None] * 2
         if parsed.path:
             path = parsed.path.strip('/').split('/')

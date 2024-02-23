@@ -174,6 +174,9 @@ def test_make_azureblob_url():
                                account='myaccount.blob.core.windows.net',
                                url='/foobar', sas='foobartoken')
             == 'https://myaccount.blob.core.windows.net/foobar/foobar.zip?foobartoken')
+    assert (azureblob_make_url('foobar.zip',
+                               url='https://myaccount.blob.core.windows.net/foobar?foobartoken')
+            == 'https://myaccount.blob.core.windows.net/foobar/foobar.zip?foobartoken')
     # forgot to input account
     with pytest.raises(ValueError):
         azureblob_make_url('foobar.zip', url='/foobar', sas='foobartoken')
