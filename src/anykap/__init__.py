@@ -355,10 +355,8 @@ class Task(_TaskBase):
             await run_task
         except asyncio.CancelledError:
             self.logger.info('task %s canceled', self.name)
-        except BaseException:
+        except Exception:
             self.logger.exception('task %s encountered error', self.name)
-            # XXX: shall we set this to a field so it is visible in CLI?
-            raise
 
     async def run_task(self, hq):
         raise NotImplementedError
