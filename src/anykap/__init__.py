@@ -1168,12 +1168,14 @@ class CRICtlData:
 
     def __init__(self, data, inspect=None):
         self._data = data
+        self._lock = asyncio.Lock()
         self._inspect = inspect
 
     async def inspect_once(self):
         # lazily inspect things
         if self._inspect is None:
-            self._inspect = await self.run_inspect()
+            async with self._lock:
+                self._inspect = await self.run_inspect()
 
         return self._inspect
 
@@ -1191,6 +1193,15 @@ class CRICtlData:
             return self.inspect[name]
 
         raise AttributeError("attribute %s is not known" % name)
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if self.OBJTYPE == getattr(other, 'OBJTYPE'):
+            return self.id == other.id
+
+        raise ValueError(f'invalid comparison {self!r} with {other!r}')
 
 
 class CRIPodSandbox(CRICtlData):
@@ -1299,6 +1310,55 @@ class CRIImage(CRICtlData):
         'status',
         'info',
     }
+
+
+class CRIDiscovery(Task):
+    """basic CRI discovery"""
+
+    def __init__(self, datacls:Type[CRICtlData], name=None, cadence=30,
+                 **query):
+        super().__init__(name=name)
+        self.datacls = datacls
+        self.cadence = cadence
+        self.query = query
+        self.watching = set()
+
+    async def run_once(self):
+        result = set(await self.datacls.list(**self.query))
+        added = result - self.watching
+        removed = self.watching - result
+        for obj in added:
+            self.send_event({
+                'kind': 'discovery',
+                'topic': 'new',
+                'objtype': self.datacls.OBJTYPE,
+                'task': self.name,
+                'object': obj,
+            })
+
+        for obj in removed:
+            self.send_event({
+                'kind': 'discovery',
+                'topic': 'lost',
+                'objtype': self.datacls.OBJTYPE,
+                'task': self.name,
+                'object': obj,
+            })
+        self.watching -= removed
+        self.watching += added
+
+    async def run_task(self):
+        async def loop():
+            while not self.need_exit():
+                await self.run_once()
+                await asyncio.sleep(self.cadence)
+
+        try:
+            loop_task = asyncio.create_task(loop(), name=f'{self.name}-loop')
+            await self.wait_exit()
+        finally:
+            loop_task.cancel()
+            await loop_task
 
 
 def main(hq):
