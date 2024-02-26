@@ -3,9 +3,12 @@ metadata:
   annotations:
     # used to locate hq datapath and replserver unix socket
     anykap/name: "{name}"
+    anykap/version: "{version}"
     # modify this if need to chroot to a different path
     # if empty or not provided, means chroot is not necessary
     anykap/chroot: "/host"
+    # uncomment this if you've specified a different path for the replserver
+    # anykap/serverpath: '/var/run/anykap-{name}.sock'
 resources:
 - daemonset.yaml
 commonLabels:

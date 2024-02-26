@@ -12,8 +12,11 @@ import shlex
 from pathlib import Path
 from importlib import resources as impresources
 from collections import namedtuple
-from anykap.envimporter import EnvImporter
+import packaging.version
+import warnings
 import logging
+from anykap.envimporter import EnvImporter
+import anykap
 
 logger = logging.getLogger('kubectl-anykap')
 
@@ -28,7 +31,7 @@ _env = EnvImporter().envname
 MANIFEST = {
     #(local name,               workspace,              fmt,    in_cm,  comment),
     ('kustomization.yaml.fmt',  'kustomization.yaml',   True,   False,  False),
-    ('daemonset.yaml',          'daemonset.yaml',       False,  False,  False),
+    ('daemonset.yaml.fmt',      'daemonset.yaml',       True,   False,  False),
     ('capture.py.fmt',          'capture.py',           True,   True,   False),
     ('__init__.py',             _env('anykap'),         False,  True,   False),
     ('azure.py',                _env('anykap.azure'),   False,  True,   True),
@@ -57,7 +60,7 @@ def kubectl(*args):
     return result.stdout
 
 
-def repl_req(pod_locator, sockpath, args,  chroot='/host'):
+def repl_req(pod_locator, args, sockpath, chroot='/host'):
     """communicate with anykap.REPLServer"""
     nc_cmd = ('nc', '-CUN', sockpath)
     sh_cmd = ('/bin/sh', '-c',
@@ -77,6 +80,7 @@ def generate_workspace(path, config):
     config['cmfiles'] = '\n'.join(
         (('  # - ' if comment else '  - ') + repr(outname))
         for (_, outname, _, in_cm, comment) in MANIFEST if in_cm)
+    config['version'] = anykap.__version__
     for (localname, outname, fmt, in_cm, comment) in MANIFEST:
         data = (resources / localname).read_text()
         if fmt:
@@ -117,8 +121,14 @@ def get_metadata(parser, args):
     except KeyError:
         parser.exit(f'unable to find annotation anykap/name in metadata')
 
-    return dict((k.removeprefix('anykap/'), v)
+    result = dict((k.removeprefix('anykap/'), v)
                 for k, v in annotations.items() if k.startswith('anykap/'))
+    version = result.get('version')
+    if (not version or (packaging.version.parse(version)
+                        != packaging.version.parse(anykap.__version__))):
+        warnings.warn('workspace created with different anykap version '
+                      f'{version}, current anykap version {anykap.__version__}')
+    return result
 
 
 def get_covered(parser, args, kubectl_args):
@@ -149,13 +159,20 @@ def get_covered(parser, args, kubectl_args):
     return namespace, output['items']
 
 
+def prep_repl_req(config):
+    name = config['name']
+    return {
+        'chroot': config.get('chroot', ''),
+        'sockpath': config.get('serverpath', f'/var/run/anykap-{name}.sock')
+    }
+
+
 def cmd_tasks(parser, args, kubectl_args):
     config = get_metadata(parser, args)
-    name = config['name']
-    chroot = config.get('chroot', '')
+    req_kw = prep_repl_req(config)
     namespace, pods = get_covered(parser, args, kubectl_args)
     node2pod = dict((pod['spec']['nodeName'], pod) for pod in pods)
-    
+
     if args.nodes:
         nodes = set(args.nodes)
         notfound = nodes - set(node2pod.keys())
@@ -168,8 +185,7 @@ def cmd_tasks(parser, args, kubectl_args):
     for node in nodes:
         pod = node2pod[node]['metadata']['name']
         result = repl_req(('-n', namespace, pod) + tuple(kubectl_args),
-                          f'/var/run/anykap-{name}.sock', ('tasks',),
-                          chroot=chroot)
+                          ('tasks',), **req_kw)
         print(f"node: {node}, pod: {pod}, result: {result}")
 
 

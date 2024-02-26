@@ -26,7 +26,8 @@ import logging
 # Constants
 # ------------------------------------------------------------------------------
 # XXX: make __all__
-__version__ = '0.1.0'
+# make sure we follow https://packaging.python.org/en/latest/specifications/version-specifiers/#version-scheme
+__version__ = '0.1.0-dev'
 USER_AGENT = f'anykap/{__version__}'
 logger = logging.getLogger('anykap')
 
@@ -332,7 +333,7 @@ class HQ(object):
         self.tasks = []
         self.done_tasks = []  # to accelerate
         self.rules = []
-        datapath = datapath or os.environ.get('ANYKAP_PATH', os.getcwd())
+        datapath = datapath or os.environ.get('ANYKAP_DATAPATH', os.getcwd())
         self.datapath = Path(datapath).absolute()
         logger.info('hq datapath: %s', self.datapath)
         if not self.datapath.is_dir():
@@ -823,7 +824,9 @@ class HQREPLServer(REPLServer):
     TASK_KEYS = ['name', 'running', 'exiting']
     ARTIFACT_KEYS = ['name', 'state', 'path', 'upload_state', 'upload_url']
 
-    def __init__(self, path='repl.sock', *args, **kwargs):
+    def __init__(self, path=None, *args, **kwargs):
+        if path is None:
+            path = os.environ.get('ANYKAP_SERVERPATH', 'repl.sock')
         super().__init__(path, *args, **kwargs)
         parser = REPLArgumentParser(prog=self.name)
         subparsers = parser.add_subparsers(dest='command', required=True)

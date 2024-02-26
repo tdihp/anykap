@@ -24,7 +24,7 @@ spec:
       containers:
       - name: anykap
         image: alpine:3  # customize this if needed
-        # image: python:3-slim  # Use this one if pod volume is wanted
+        # image: python:3-slim  # Use a image with Python installed if no chroot
         resources:
           limits:
             cpu: 100m
@@ -32,10 +32,14 @@ spec:
           requests:
             cpu: 100m
             memory: 200Mi
-        # env:
+        env:
+        - name: ANYKAP_DATAPATH  # artifacts will be saved in this path
+          value: "/var/lib/anykap/{name}"
+        - name: ANYKAP_SERVERPATH  # replserver unix socket listening path
+          value: "/var/run/anykap-{name}.sock"
         envFrom:
-          - configMapRef:
-              name: env
+        - configMapRef:
+            name: env
         securityContext:
           # runAsUser: 
           # allowPrivilegeEscalation: 
