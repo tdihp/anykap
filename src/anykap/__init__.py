@@ -62,10 +62,12 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout,
     in the context block"""
     try:
         yield p
-    except BaseException as e:
-        logger.warning('tearing down subprocess %r with timeouts %s and %s '
-                       'due to exception %s',
-                       p, terminate_timeout, kill_timeout, e)
+    finally:
+        if p.returncode != None:
+            return
+
+        logger.warning('tearing down subprocess %r with timeouts %s and %s',
+                       p, terminate_timeout, kill_timeout)
         logger.info('sending terminate')
         p.terminate()
         try:
@@ -77,7 +79,7 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout,
                 logger.info('terminate complete')
             else:
                 logger.warning('terminate interrupted')
-            raise
+            return
 
         logger.info('sending kill')
         p.kill()
@@ -90,8 +92,6 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout,
                 logger.info('kill complete')
             else:
                 logger.warning('kill interrupted')
-            raise
-        raise
 
 # -------------
 # Core Concepts
@@ -177,7 +177,7 @@ class FutureReceptor(Receptor):
     def get_nowait(self):
         return self.value
 
-    async def get(self, ):
+    async def get(self,):
         # done, pending = await asyncio.wait([self.future], timeout=timeout)
         # regardless of timeout or not, we return the value.
         loop = asyncio.get_running_loop()
@@ -319,7 +319,8 @@ class Task(_TaskBase):
         return self.running and self.need_exit()
 
     def exit(self):
-        """intended method to directly terminate this task"""
+        """method to directly terminate this task
+        """
         self.receptors['exit'].send(True)
 
     def need_exit(self):
@@ -327,16 +328,37 @@ class Task(_TaskBase):
         return self.receptors['exit'].get_nowait()
 
     async def wait_exit(self):
-        try:
-            return await self.receptors['exit'].get()
-        except asyncio.CancelledError:
-            return
+        return await self.receptors['exit'].get()
 
     async def run(self, hq):
+        run_task = asyncio.create_task(self.run_task(hq),
+                                       name=f'{self.name}-run_task')
+        wait_exit_task = asyncio.create_task(self.wait_exit(),
+                                             name=f'{self.name}-wait_exit')
+        done, pending = await asyncio.wait([run_task, wait_exit_task],
+                                           return_when=asyncio.FIRST_COMPLETED)
+        logger.debug('done: %s, pending: %s', done, pending)
+        if wait_exit_task in done:
+            assert run_task in pending
+            run_task.cancel()
+        else:
+            assert run_task in done
+            assert wait_exit_task in pending
+            wait_exit_task.cancel()
+
         try:
-            await self.run_task(hq)
-        except Exception:
-            self.logger.exception('task encountered error')
+            await wait_exit_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            self.logger.info('task %s canceled', self.name)
+        except BaseException:
+            self.logger.exception('task %s encountered error', self.name)
+            # XXX: shall we set this to a field so it is visible in CLI?
+            raise
 
     async def run_task(self, hq):
         raise NotImplementedError
@@ -576,6 +598,7 @@ class ShellTask(Task):
 
             stdout = prepare_file(self.stdout_mode, self.stdout_file)
             stderr = prepare_file(self.stderr_mode, self.stderr_file)
+            logger.info('starting subprocess %s', args)
             p = await asyncio.subprocess.create_subprocess_exec(
                 *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
@@ -590,35 +613,33 @@ class ShellTask(Task):
                     hq, p.stderr, self.stderr_filter, 'stderr'
                 ), name=f'{self.name}-notify-stderr'))
 
-            wait_exit_task = asyncio.create_task(self.wait_exit(),
-                                                 name=f'{self.name}-wait-exit')
             wait_p_task = asyncio.create_task(p.wait(),
                                               name=f'{self.name}-wait-p')
+            all_tasks = [wait_p_task] + notify_tasks
             try:
                 async with subprocess_teardown(
                     p, self.terminate_timeout, self.kill_timeout, logger):
                     done, pending = await asyncio.wait(
-                        [wait_exit_task, wait_p_task],
-                        timeout=self.timeout,
-                        return_when=asyncio.FIRST_COMPLETED)
-                    if wait_p_task in done:
-                        logger.info('script completed')
-                    elif wait_exit_task in done:
-                        logger.info('task exited externally')
-                    else:
-                        assert not done
-                        logger.info('reached timeout')
-                    for task in pending:
-                        task.cancel()
-                    # the rest should fold quickly
-                    await asyncio.gather(list(pending))
+                        all_tasks, timeout=self.timeout,
+                        return_when='FIRST_EXCEPTION')
+                    if pending:
+                        logger.debug('cancelling tasks in pending: %s', pending)
+                        for task in pending:
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                logger.debug('task %s cancelled', task)
+
+                    # the callstacks will be captured anyway, evaluate those in
+                    # done so the errors get propergated
+                    if done:
+                        logger.debug('done tasks: %s', done)
+                        asyncio.gather(*done)
             finally:
                 # the subprocess should already be canceled
                 result = p.returncode
                 logger.info(f'script exit code: {result!r}')
-                if notify_tasks:
-                    # notify tasks should exit quickly once EOF reached
-                    await asyncio.gather(notify_tasks)
                 (artifact.path / self.result_file).write_text(str(result))
                 self.send_event(hq, 
                     {
@@ -855,8 +876,7 @@ class REPLServer(Task):
         server = await asyncio.get_running_loop().create_unix_server(
             lambda: REPLServerProtocol(self, **self.kwargs),
             hq.datapath / self.path)
-        async with server:
-            await self.wait_exit()
+        await server.serve_forever()
 
     def call_cmd(self, *args):
         raise NotImplementedError()
