@@ -7,7 +7,7 @@ from pathlib import Path
 import itertools as it
 import asyncio
 import asyncio.queues as queue
-import asyncio.subprocess as async_subproc
+import asyncio.subprocess
 import datetime
 import re
 import contextlib
@@ -54,6 +54,44 @@ def sanitize_name(name:str):
     return re.sub(r'[^a-z0-9_-]', '',
                   re.sub(r'\s+', '_', name.strip().lower())).strip('_-')[:255]
 
+@contextlib.asynccontextmanager
+async def subprocess_teardown(p, terminate_timeout, kill_timeout,
+                              logger=logger):
+    """this context manager tears down a asyncio.Process when any exception
+    occurs and the subprocess is not complete. Users should wait with timeout
+    in the context block"""
+    try:
+        yield p
+    except BaseException as e:
+        logger.warning('tearing down subprocess %r with timeouts %s and %s '
+                       'due to exception %s',
+                       p, terminate_timeout, kill_timeout, e)
+        logger.info('sending terminate')
+        p.terminate()
+        try:
+            await asyncio.wait_for(p.wait(), timeout=terminate_timeout)
+        except asyncio.TimeoutError:
+            logger.warning('terminate timed out')
+        else:
+            if p.returncode != None:
+                logger.info('terminate complete')
+            else:
+                logger.warning('terminate interrupted')
+            raise
+
+        logger.info('sending kill')
+        p.kill()
+        try:
+            await asyncio.wait_for(p.wait(), timeout=terminate_timeout)
+        except asyncio.TimeoutError:
+            logger.warning('kill timed out')
+        else:
+            if p.returncode != None:
+                logger.info('kill complete')
+            else:
+                logger.warning('kill interrupted')
+            raise
+        raise
 
 # -------------
 # Core Concepts
@@ -320,7 +358,7 @@ class Task(_TaskBase):
         if self._task and not self._task.done():
             await self._task
 
-class HQ(object):
+class HQ:
     """
     A one for all manager for Tasks, Rules, Artifacts
     rules: a list of functions to react on events. Rules can be added,
@@ -505,6 +543,7 @@ class ShellTask(Task):
         super().__post_init__()
         if not self.script:
             raise ValueError('script is not provided')
+        # XXX: more validations
 
     async def run_task(self, hq):
         logger = self.logger
@@ -526,18 +565,18 @@ class ShellTask(Task):
                 if mode == 'artifact':
                     return stack.enter_context(
                         # seems to work even when subprocess is test mode
-                        open(artifact.path / filename, 'wb'))  
+                        open(artifact.path / filename, 'wb'))
                 elif mode == 'null':
-                    return async_subproc.DEVNULL
+                    return asyncio.subprocess.DEVNULL
                 elif mode == 'stdout':
-                    return async_subproc.STDOUT
+                    return asyncio.subprocess.STDOUT
                 elif mode == 'notify':
-                    return async_subproc.PIPE
+                    return asyncio.subprocess.PIPE
                 raise ValueError(f'unrecognized mode {mode!r}')
 
             stdout = prepare_file(self.stdout_mode, self.stdout_file)
             stderr = prepare_file(self.stderr_mode, self.stderr_file)
-            p = await async_subproc.create_subprocess_exec(
+            p = await asyncio.subprocess.create_subprocess_exec(
                 *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
             )
@@ -553,38 +592,41 @@ class ShellTask(Task):
 
             wait_exit_task = asyncio.create_task(self.wait_exit(),
                                                  name=f'{self.name}-wait-exit')
-            wait_p_task = asyncio.create_task(p.wait(), name=f'{self.name}-wait-p')
-            done, pending = await asyncio.wait(
-                [wait_exit_task, wait_p_task],
-                timeout=self.timeout,
-                return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.wait(pending)
-            need_cancel = True
-            if wait_p_task in done:
-                need_cancel = False
-                logger.info('script completed')
-            elif wait_exit_task in done:
-                logger.info('task exited externally')
-            else:
-                logger.info('reached timeout')
-
-            if need_cancel:
-                await self.cancel_process(p)
-            # any way, we try to get return code
-            result = p.returncode
-            logger.info(f'script exit code: {result!r}')
-            if notify_tasks:
-                await asyncio.wait(notify_tasks)
-            (artifact.path / self.result_file).write_text(str(result))
-            self.send_event(hq, 
-                {
-                    'kind': 'shell',
-                    'topic': 'complete',
-                    'status': result,
-                    'task_name': self.name,
-                })
+            wait_p_task = asyncio.create_task(p.wait(),
+                                              name=f'{self.name}-wait-p')
+            try:
+                async with subprocess_teardown(
+                    p, self.terminate_timeout, self.kill_timeout, logger):
+                    done, pending = await asyncio.wait(
+                        [wait_exit_task, wait_p_task],
+                        timeout=self.timeout,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    if wait_p_task in done:
+                        logger.info('script completed')
+                    elif wait_exit_task in done:
+                        logger.info('task exited externally')
+                    else:
+                        assert not done
+                        logger.info('reached timeout')
+                    for task in pending:
+                        task.cancel()
+                    # the rest should fold quickly
+                    await asyncio.gather(list(pending))
+            finally:
+                # the subprocess should already be canceled
+                result = p.returncode
+                logger.info(f'script exit code: {result!r}')
+                if notify_tasks:
+                    # notify tasks should exit quickly once EOF reached
+                    await asyncio.gather(notify_tasks)
+                (artifact.path / self.result_file).write_text(str(result))
+                self.send_event(hq, 
+                    {
+                        'kind': 'shell',
+                        'topic': 'complete',
+                        'status': result,
+                        'task_name': self.name,
+                    })
 
     async def notify_output(self, hq, stream, pattern, name):
         if pattern:
@@ -906,7 +948,7 @@ class HQREPLServer(REPLServer):
         return []
 
 
-class Uploader(object):
+class Uploader:
     """uploader interface. Uploader should eitehr implement the async or the
     sync version"""
 
@@ -1066,6 +1108,197 @@ def archive_zip(datapath:str, outpath:str, basedir:str=None, **kwargs):
             for fn in filenames:
                 zf.write(os.path.join(dirpath, fn), os.path.join(basedir, relpath, fn))
     return fpath
+
+
+# -------------
+# CRI discovery
+# -------------
+class CRICtlData:
+    OBJTYPE:str
+    LIST_KEY:str
+    INSPECT_KEY:str
+    DATA_LIST_KEY:str
+    RUN_TIMEOUT:int = 3
+    TERMINATE_TIMEOUT = 3
+    KILL_TIMEOUT = 1
+    DATA_KEYS:set[str] = set()
+    INSPECT_KEYS:set[str] = set()
+
+    @classmethod
+    async def run_crictl(cls, args):
+        logger.debug('running command %r', args)
+        p = await asyncio.subprocess.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        async with subprocess_teardown(
+            p, cls.TERMINATE_TIMEOUT, cls.KILL_TIMEOUT):
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    p.communicate(), timeout=cls.RUN_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning('crictl command %r timed out in %r secs',
+                            args, cls.RUN_TIMEOUT)
+                raise
+
+        if p.returncode != 0:
+            logger.warning('crictl returncode: %r stdout: %r stderr: %r',
+                           p.returncode, stdout, stderr)
+            raise RuntimeError(
+                f'crictl command {args!r} got return code {p.returncode}')
+        try:
+            data = json.loads(stdout.decode())
+        except Exception as e:
+            logger.error('failed when decoding crictl output: %s', e)
+            raise
+        return data
+
+    @classmethod
+    async def list(cls, **kwargs):
+        # XXX: with optional chroot prepended
+        args = ['crictl', cls.LIST_KEY, '-o', 'json'] + cls.query_args(**kwargs)
+        data = await cls.run_crictl(args)
+        return [cls(o) for o in data[cls.DATA_LIST_KEY]]
+
+    async def run_inspect(self):
+        return await self.run_crictl(
+            ['crictl', self.INSPECT_KEY, self.id, '-o', 'json'])
+
+    @classmethod
+    def query_args(cls, **kwargs):
+        return []
+
+    def __init__(self, data, inspect=None):
+        self._data = data
+        self._inspect = inspect
+
+    async def inspect_once(self):
+        # lazily inspect things
+        if self._inspect is None:
+            self._inspect = await self.run_inspect()
+
+        return self._inspect
+
+    @property
+    def inspect(self):
+        if self._inspect:
+            return self._inspect
+        raise Exception('inspect_once should be called before accessing')
+
+    def __getattr__(self, name):
+        if name in self.DATA_KEYS:
+            return self._data[name]
+
+        if name in self.INSPECT_KEYS:
+            return self.inspect[name]
+
+        raise AttributeError("attribute %s is not known" % name)
+
+
+class CRIPodSandbox(CRICtlData):
+    OBJTYPE = 'pod'
+    LIST_KEY = 'pods'
+    INSPECT_KEY = 'inspectp'
+    DATA_LIST_KEY = 'items'
+    DATA_KEYS = {
+        'id',
+        'metadata',
+        'state',
+        'createdAt',
+        'labels',
+        'annotations',
+        'runtimeHandler',
+    }
+    INSPECT_KEYS = {
+        'status',
+        'info',
+    }
+
+    @classmethod
+    def query_args(cls, namespace=None, name=None, labels=None):
+        args = []
+        if namespace:
+            args += ['--namespace', namespace]
+
+        if name:
+            args += ['--name', name]
+        
+        if labels:
+            for label in labels:
+                args += ['--label', label]
+
+        return args
+
+
+class CRIContainer(CRICtlData):
+    OBJTYPE = 'container'
+    LIST_KEY = 'ps'
+    INSPECT_KEY = 'inspect'
+    DATA_LIST_KEY = 'containers'
+    POD_NAME_LABEL = "io.kubernetes.pod.name"
+    POD_NAMESPACE_LABEL = "io.kubernetes.pod.namespace"
+    POD_UID_LABEL = "io.kubernetes.pod.uid"
+    DATA_KEYS = {
+        'id',
+        'podSandboxId',
+        'metadata',
+        'image',
+        'imageRef',
+        'state',
+        'createdAt',
+        'labels',
+        'annotations',
+    }
+    INSPECT_KEYS = {
+        'status',
+        'info',
+    }
+
+    @classmethod
+    def query_args(cls, name=None, image=None, labels=None,
+                 pod_name=None, pod_namespace=None, pod_uid=None):
+        args = []
+
+        if name:
+            args += ['--name', name]
+
+        if image:
+            args += ['--image', image]
+
+        labels = list(labels) if labels else []
+
+        if pod_name:
+            labels.append(cls.POD_NAME_LABEL + '=' + pod_name)
+
+        if pod_namespace:
+            labels.append(cls.POD_NAMESPACE_LABEL + '=' + pod_namespace)
+
+        if pod_uid:
+            labels.append(cls.POD_UID_LABEL + '=' + pod_uid)
+
+        for label in labels:
+            args += ['--label', label]
+
+        return args
+
+
+class CRIImage(CRICtlData):
+    OBJTYPE = 'image'
+    LIST_KEY = 'img'
+    INSPECT_KEY = 'inspecti'
+    DATA_LIST_KEY = 'images'
+    DATA_KEYS = {
+        'id',
+        'repoTags',
+        'repoDigests',
+        'size',
+        'uid',
+        'username',
+        'spec',
+        'pinned',
+    }
+    INSPECT_KEYS = {
+        'status',
+        'info',
+    }
 
 
 def main(hq):
