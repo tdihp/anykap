@@ -13,8 +13,8 @@ def logconf(caplog):
 
 
 @pytest.fixture
-def hq(tmp_path, event_loop):
-    return HQ(datapath=tmp_path / 'hq', loop=event_loop)
+def hq(tmp_path):
+    return HQ(datapath=tmp_path / 'hq')
 
 
 @pytest_asyncio.fixture

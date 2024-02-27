@@ -385,7 +385,7 @@ class HQ:
            not removed
     tasks: a list of Task objects
     """
-    def __init__(self, name=None, datapath=None, loop=None):
+    def __init__(self, name=None, datapath=None):
         """by default we use cwd as datapath"""
         # self.tasks = set()
         self.tasks = []
@@ -877,7 +877,7 @@ class REPLServer(Task):
         await server.serve_forever()
 
     def call_cmd(self, *args):
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 class HQREPLServer(REPLServer):
@@ -1330,23 +1330,67 @@ class CRIImage(CRICtlData):
     }
 
 
-class CRIDiscovery(Task):
-    """basic CRI discovery"""
-
-    def __init__(self, datacls:Type[CRICtlData], name=None, cadence=30,
-                 **query):
+class PeriodicTask(Task):
+    def __init__(self, cadence, timeout=None, name=None):
         super().__init__(name=name)
+        self.cadence = cadence
+        self.timeout = timeout
+
+    async def run_once(self, hq):
+        raise NotImplementedError
+
+    async def run_task(self, hq):
+        while True:
+            start_t = time.monotonic()
+            try:
+                await asyncio.wait_for(self.run_once(hq), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning('task run timed out')
+            except Exception:
+                self.logger.exception('task run failed')
+            consumed = time.monotonic() - start_t
+            self.logger.debug('call consumed %s seconds', consumed)
+            gap = self.cadence - consumed
+            if gap > 0:
+                self.logger.debug('sleep for %s seconds', gap)
+                await asyncio.sleep(gap)
+
+
+class CRIDiscovery(PeriodicTask):
+    """basic CRI discovery"""
+    def __init__(self, datacls:Type[CRICtlData], name=None, cadence=30,
+                 timeout=30, inspect=False, **query):
+        super().__init__(name=name, cadence=cadence, timeout=timeout)
         self.datacls = datacls
         self.cadence = cadence
+        self.inspect = inspect
         self.query = query
         self.watching = set()
 
-    async def run_once(self):
+    def get_watching(self):
+        return set(self.watching)
+
+    async def run_once(self, hq):
         result = set(await self.datacls.list(**self.query))
+        if hasattr(self, 'filter'):
+            # we optionally filter the list with some external filter
+            # for filter crictl ps with a crictl pods outcome
+            result = set(filter(self.filter, result))
+
         added = result - self.watching
         removed = self.watching - result
+        for obj in removed:
+            self.send_event(hq, {
+                'kind': 'discovery',
+                'topic': 'lost',
+                'objtype': self.datacls.OBJTYPE,
+                'task': self.name,
+                'object': obj,
+            })
         for obj in added:
-            self.send_event({
+            if self.inspect:
+                await obj.inspect_once()
+            self.send_event(hq, {
                 'kind': 'discovery',
                 'topic': 'new',
                 'objtype': self.datacls.OBJTYPE,
@@ -1354,29 +1398,37 @@ class CRIDiscovery(Task):
                 'object': obj,
             })
 
-        for obj in removed:
-            self.send_event({
-                'kind': 'discovery',
-                'topic': 'lost',
-                'objtype': self.datacls.OBJTYPE,
-                'task': self.name,
-                'object': obj,
-            })
         self.watching -= removed
-        self.watching += added
+        self.watching |= added
 
-    async def run_task(self):
-        async def loop():
-            while not self.need_exit():
-                await self.run_once()
-                await asyncio.sleep(self.cadence)
+class PodDiscovery(CRIDiscovery):
+    def __init__(**kwargs):
+        super().__init__(CRIPodSandbox, **kwargs)
 
-        try:
-            loop_task = asyncio.create_task(loop(), name=f'{self.name}-loop')
-            await self.wait_exit()
-        finally:
-            loop_task.cancel()
-            await loop_task
+class ContainerDiscovery(CRIDiscovery):
+    def __init__(**kwargs):
+        super().__init__(CRIContainer, **kwargs)
+
+class ImageDiscovery(CRIDiscovery):
+    def __init__(**kwargs):
+        super().__init__(CRIImage, **kwargs)
+
+class PodContainerDiscovery(PeriodicTask):
+    """a pod -> container combo"""
+    def __init__(self, pod_query, container_query,
+                 name=None, cadence=30,
+                 inspect_pod=False, inspect_container=False):
+        super().__init__(name=name, cadence=cadence)
+        self._pod_discovery = PodDiscovery(inspect=inspect_pod, **pod_query)
+        self._container_discovery = ContainerDiscovery(
+            inspect=inspect_container, **container_query)
+
+    async def run_once(self, hq):
+        await self._pod_discovery.run_once(hq)
+        pod_ids = set(pod.id for pod in self._pod_discovery.get_watching())
+        self._container_discovery.filter = \
+            lambda item: item.podSandboxId in pod_ids
+        await self._container_discovery.run_once(hq)
 
 
 def main(hq):
