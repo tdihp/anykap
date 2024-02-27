@@ -1402,15 +1402,15 @@ class CRIDiscovery(PeriodicTask):
         self.watching |= added
 
 class PodDiscovery(CRIDiscovery):
-    def __init__(**kwargs):
+    def __init__(self, **kwargs):
         super().__init__(CRIPodSandbox, **kwargs)
 
 class ContainerDiscovery(CRIDiscovery):
-    def __init__(**kwargs):
+    def __init__(self, **kwargs):
         super().__init__(CRIContainer, **kwargs)
 
 class ImageDiscovery(CRIDiscovery):
-    def __init__(**kwargs):
+    def __init__(self, **kwargs):
         super().__init__(CRIImage, **kwargs)
 
 class PodContainerDiscovery(PeriodicTask):
