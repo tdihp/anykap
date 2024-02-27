@@ -12,8 +12,9 @@ def logconf(caplog):
     caplog.set_level(logging.DEBUG)
 
 
-@pytest.fixture
-def hq(tmp_path):
+# use async fixture since 3.9 asyncio.queues.Queue requires current loop
+@pytest_asyncio.fixture
+async def hq(tmp_path):
     return HQ(datapath=tmp_path / 'hq')
 
 

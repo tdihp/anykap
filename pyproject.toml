@@ -28,6 +28,18 @@ kubectl-anykap = "anykap.client:main"
 [tool.hatch.version]
 path = "src/anykap/__init__.py"
 
+[tool.hatch.envs.test]
+dependencies = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "pytest-kubernetes",
+  "azure-storage-blob",  # for testing azureblob
+]
+
+[[tool.hatch.envs.test.matrix]]
+python = ["3.9", "3.10", "3.11", "3.12"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
