@@ -331,7 +331,7 @@ _TaskBase = make_dataclass('Task', [
 )
 
 class Task(_TaskBase):
-    # XXX: milestones, counters, recent events, recent warnings
+    # XXX: counters, recent events
     counterdict = defaultdict(it.count)
     def __post_init__(self):
         super().__post_init__()
@@ -940,12 +940,13 @@ class REPLServer(Task):
         raise NotImplementedError
 
 
-def make_hq_replserver_parser(parser, parents=None):
+def make_hq_replserver_parser(
+        subparsers, parser_class=argparse.ArgumentParser, parents=None):
     """we capture this as a function so can be shared with client"""
     parents = parents or []
-    subparsers = parser.add_subparsers(dest='command', required=True)
+    # subparsers = parser.add_subparsers(dest='command', required=True)
     # common options for task and artifact
-    common = type(parser)(add_help=False)
+    common = parser_class(add_help=False)
     common.add_argument('-r', '--regex', action='store_true',
                         help='filter name with regular expression')
     common.add_argument('-a', '--all', action='store_true',
@@ -991,7 +992,8 @@ class HQREPLServer(REPLServer):
         parser.add_argument('-o', '--output', default='text',
                             choices=['text', 'json'],
                             help='switching output format')
-        commands = make_hq_replserver_parser(parser)
+        subparsers = parser.add_subparsers(dest='command', required=True)
+        commands = make_hq_replserver_parser(subparsers, REPLArgumentParser)
         commands['info'].set_defaults(func=self.cmd_info)
         commands['tasks'].set_defaults(
             func=self.cmd_tasks, keys=self.TASK_KEYS)

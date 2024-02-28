@@ -72,7 +72,11 @@ def repl_req(pod_locator, args, sockpath, chroot='/host'):
         command += ('chroot', chroot)
 
     command += sh_cmd  
-    return kubectl(*command)
+    result = kubectl(*command)
+    lines = result.rstrip().splitlines()
+    if lines[0] != 'OK':
+        raise RuntimeError(f'got non-ok: {result}')
+    return lines[1:]
 
 
 def generate_workspace(path, config):
@@ -181,25 +185,32 @@ def cmd_tasks(parser, args, kubectl_args):
         nodes = sorted(nodes)
     else:
         nodes = sorted(node2pod.keys())
-    query = ('tasks',)
+    query = ('-ojson', 'tasks',)
     if args.regex:
         query += ('-r',)
     if args.stop:
-        if not args.task:
+        if not args.name:
             parser.exit('task name must be specified for stop')
         query += ('-s',)
     if args.all:
         query += ('-a',)
-    if args.task:
-        query += tuple(args.task)
+    if args.name:
+        query += tuple(args.name)
+    results = {}
     for node in nodes:
         pod = node2pod[node]['metadata']['name']
-        result = repl_req(('-n', namespace, pod) + tuple(kubectl_args),
-                          query, **req_kw)
-        print(f"node: {node}, pod: {pod}, result: {result}")
+        try:
+            result = repl_req(('-n', namespace, pod) + tuple(kubectl_args),
+                              query, **req_kw)
+            assert len(result) == 1
+            results[node] = json.loads(result[0])['items']
+        except Exception:
+            logger.exception('failed querying for node %s (pod %s)', node, pod)
 
+    import pprint
+    pprint.pprint(results)
 
-def cmd_artifacts():
+def cmd_artifacts(parser, args, kubectl_args):
     pass
 
 
@@ -218,12 +229,14 @@ def main():
     nodes.add_argument('--nodes',
                        help='comma separated list of nodes, '
                             'defaults to all nodes')
-    commands = parser.add_subparsers(title='command', required=True)
-    init = commands.add_parser('init',
+    subpersers = parser.add_subparsers(title='command', required=True)
+    init = subpersers.add_parser('init',
                                help='generates a kustomization directory')
     init.set_defaults(func=cmd_init)
     init.add_argument('name', type=name_type, help='name of the capture')
-    anykap.make_hq_replserver_parser(parser, parents=[nodes])
+    commands = anykap.make_hq_replserver_parser(subpersers, parents=[nodes])
+    commands['tasks'].set_defaults(func=cmd_tasks)
+    commands['artifacts'].set_defaults(func=cmd_artifacts)
     # we only parse known args, all unknown args are forwarded to kubectl
     # unless someone spot a reason we shouldn't do this
     args, kubectl_args = parser.parse_known_args()
