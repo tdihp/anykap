@@ -9,12 +9,14 @@ import re
 import yaml  # we favor json whenever we can
 import json
 import shlex
-from pathlib import Path
+from pathlib import Path, PosixPath
 from importlib import resources as impresources
 from collections import namedtuple
 import packaging.version
 import warnings
+import pprint
 import logging
+import tarfile
 from anykap.envimporter import EnvImporter
 import anykap
 
@@ -77,6 +79,20 @@ def repl_req(pod_locator, args, sockpath, chroot='/host'):
     if lines[0] != 'OK':
         raise RuntimeError(f'got non-ok: {result}')
     return lines[1:]
+
+
+def tar_copy_artifact(pod_locator, path, outpath, chroot='/host'):
+    """kubectl command to send a artifact path to stdout as gzipped tar"""
+    command = ('kubectl', 'exec',) + pod_locator + ('--',)
+    if chroot:
+        command += ('chroot', chroot)
+    command += ('tar', 'zc', '-C', str(path.parent), path.name)
+    logger.debug('running tar command %r', command)
+    p = subprocess.Popen(command, env=os.environb, stdout=subprocess.PIPE)
+    with tarfile.open(fileobj=p.stdout, mode='r|*') as tf:
+        tf.extractall(path=outpath)
+    if p.wait() != 0:
+        raise RuntimeError(f'tar copy failed, exit code {p.returncode}')
 
 
 def generate_workspace(path, config):
@@ -171,10 +187,7 @@ def prep_repl_req(config):
     }
 
 
-def cmd_tasks(parser, args, kubectl_args):
-    config = get_metadata(parser, args)
-    req_kw = prep_repl_req(config)
-    namespace, pods = get_covered(parser, args, kubectl_args)
+def iter_nodes(parser, args, pods):
     node2pod = dict((pod['spec']['nodeName'], pod) for pod in pods)
 
     if args.nodes:
@@ -185,6 +198,15 @@ def cmd_tasks(parser, args, kubectl_args):
         nodes = sorted(nodes)
     else:
         nodes = sorted(node2pod.keys())
+
+    for node in nodes:
+        yield node, node2pod[node]['metadata']['name']
+
+
+def cmd_tasks(parser, args, kubectl_args):
+    config = get_metadata(parser, args)
+    req_kw = prep_repl_req(config)
+    namespace, pods = get_covered(parser, args, kubectl_args)
     query = ('-ojson', 'tasks',)
     if args.regex:
         query += ('-r',)
@@ -197,8 +219,7 @@ def cmd_tasks(parser, args, kubectl_args):
     if args.name:
         query += tuple(args.name)
     results = {}
-    for node in nodes:
-        pod = node2pod[node]['metadata']['name']
+    for node, pod in iter_nodes(parser, args, pods):
         try:
             result = repl_req(('-n', namespace, pod) + tuple(kubectl_args),
                               query, **req_kw)
@@ -206,13 +227,71 @@ def cmd_tasks(parser, args, kubectl_args):
             results[node] = json.loads(result[0])['items']
         except Exception:
             logger.exception('failed querying for node %s (pod %s)', node, pod)
-
-    import pprint
+            continue
     pprint.pprint(results)
 
-def cmd_artifacts(parser, args, kubectl_args):
-    pass
 
+def copy_artifacts(parser, args, kubectl_args):
+    # config = get_metadata(parser, args)
+    # req_kw = prep_repl_req(config)
+    # namespace, pods = get_covered(parser, args, kubectl_args)
+    artifacts_path = (args.kustomize / 'artifacts')
+    artifacts_path.mkdir(exist_ok=True)
+
+
+def cmd_artifacts(parser, args, kubectl_args):
+    config = get_metadata(parser, args)
+    req_kw = prep_repl_req(config)
+    namespace, pods = get_covered(parser, args, kubectl_args)
+    query = ('-ojson', 'artifacts',)
+    if args.regex:
+        query += ('-r',)
+    if args.all and not args.mark_uploaded and not args.copy:
+        query += ('-a',)
+    if args.mark_uploaded and not args.copy:
+        query += ('--mark-uploaded',)
+        if not args.name:
+            parser.exit('artifact name must be specified for mark-uploaded')
+    if args.copy:
+        artifacts_path = (args.kustomize / 'artifacts')
+        artifacts_path.mkdir(exist_ok=True)
+
+    results = {}
+    for node, pod in iter_nodes(parser, args, pods):
+        try:
+            result = repl_req(('-n', namespace, pod) + tuple(kubectl_args),
+                              query, **req_kw)
+            assert len(result) == 1
+            artifacts = json.loads(result[0])['items']
+            results[node] = artifacts
+        except Exception:
+            logger.exception('failed querying for node %s (pod %s)', node, pod)
+            continue
+        if args.copy:
+            outcome = []
+            results[node] = outcome
+            for a in artifacts:
+                if a['upload_state'] == 'completed':
+                    logger.debug('skipping already uploaded artifact %s',
+                                 a['name'])
+                    continue
+                try:
+
+                    logger.info('copying artifact %s', a['name'])
+                    tar_copy_artifact(
+                        ('-n', namespace, pod) + tuple(kubectl_args),
+                        PosixPath(a['path']), artifacts_path,
+                        chroot=config['chroot'],)
+                    response, = repl_req(
+                        ('-n', namespace, pod) + tuple(kubectl_args),
+                        ('-ojson', 'artifacts', '--mark-uploaded', a['name']),
+                        **req_kw)
+                    outcome.extend(json.loads(response)['items'])
+                except Exception:
+                    logger.exception('failed when copying node %s artifact %s',
+                                     node, a['name'])
+                    continue
+    pprint.pprint(results)
 
 def main():
     import argparse
@@ -237,6 +316,11 @@ def main():
     commands = anykap.make_hq_replserver_parser(subpersers, parents=[nodes])
     commands['tasks'].set_defaults(func=cmd_tasks)
     commands['artifacts'].set_defaults(func=cmd_artifacts)
+    commands['artifacts'].add_argument(
+        '--copy', action='store_true',
+        help='copy all completed and unuploaded artifacts to '
+             '<kustomize>/artifacts/. this option marks all successful copies '
+             'with "--mark-uploaded"')
     # we only parse known args, all unknown args are forwarded to kubectl
     # unless someone spot a reason we shouldn't do this
     args, kubectl_args = parser.parse_known_args()

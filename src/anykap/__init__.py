@@ -1024,6 +1024,16 @@ class HQREPLServer(REPLServer):
                                    for k in args.keys) for d in dicts)
             return lines
 
+    def filter_name(self, args, items):
+        if args.name:
+            if args.regex:
+                patterns = list(map(re.compile, args.name))
+                return [item for item in items if any(pattern.search(item.name)
+                                                      for pattern in patterns)]
+            else:
+                return [item for item in items if item.name in args.name]
+        return items
+
     def cmd_tasks(self, args):
         if not args.name and args.stop:
             self.parser.error('task name must exist for stop')
@@ -1033,14 +1043,7 @@ class HQREPLServer(REPLServer):
         else:
             tasks = list(t for t in tasks if t.running)
 
-        if args.name:
-            if args.regex:
-                patterns = list(map(re.compile, args.name))
-                tasks = list(t for t in tasks
-                             if any(pattern.search(t.name)
-                                    for pattern in patterns))
-            else:
-                tasks = [t for t in tasks if t.name in args.name]
+        tasks = self.filter_name(args, tasks)
         if args.stop:
             tasks = list(t for t in tasks if not t.need_exit())
             for t in tasks:
@@ -1049,17 +1052,15 @@ class HQREPLServer(REPLServer):
 
     def cmd_artifacts(self, args):
         artifacts = list(self.hq.artifacts)
-        if not args.all:
+        if not args.all or args.mark_uploaded:
             artifacts = [a for a in artifacts if a.state == 'completed']
-        if args.name:
-            if args.regex:
-                patterns = list(map(re.compile, args.name))
-                artifacts = list(a for a in artifacts
-                             if any(pattern.search(a.name)
-                                    for pattern in patterns))
-            else:
-                artifacts = [a for a in artifacts if a.name in args.name]
-
+        artifacts = self.filter_name(args, artifacts)
+        if args.mark_uploaded:
+            if not args.name:
+                self.parser.error('artifact name must exist for mark upload')
+            artifacts = [a for a in artifacts if a.upload_state != 'completed']
+            for a in artifacts:
+                a.upload_complete('<manual>')
         return self.format_results(args, artifacts)
 
     def cmd_send(self, args):
