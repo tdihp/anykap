@@ -174,19 +174,33 @@ def cmd_tasks(parser, args, kubectl_args):
     node2pod = dict((pod['spec']['nodeName'], pod) for pod in pods)
 
     if args.nodes:
-        nodes = set(args.nodes)
+        nodes = set(node.strip() for node in args.nodes.split(','))
         notfound = nodes - set(node2pod.keys())
         if notfound:
             parser.exit('nodes specified not found: %r' % notfound)
         nodes = sorted(nodes)
     else:
         nodes = sorted(node2pod.keys())
-    
+    query = ('tasks',)
+    if args.regex:
+        query += ('-r',)
+    if args.stop:
+        if not args.task:
+            parser.exit('task name must be specified for stop')
+        query += ('-s',)
+    if args.all:
+        query += ('-a',)
+    if args.task:
+        query += tuple(args.task)
     for node in nodes:
         pod = node2pod[node]['metadata']['name']
         result = repl_req(('-n', namespace, pod) + tuple(kubectl_args),
-                          ('tasks',), **req_kw)
+                          query, **req_kw)
         print(f"node: {node}, pod: {pod}, result: {result}")
+
+
+def cmd_artifacts():
+    pass
 
 
 def main():
@@ -201,31 +215,15 @@ def main():
     parser.add_argument('-k', '--kustomize', type=Path, default='.', 
         help='path to initialize, defaults to current directory')
     nodes = argparse.ArgumentParser(add_help=False)
-    nodes.add_argument('nodes', nargs='*',
-                       help='nodes to visit, default to all nodes covered')
+    nodes.add_argument('--nodes',
+                       help='comma separated list of nodes, '
+                            'defaults to all nodes')
     commands = parser.add_subparsers(title='command', required=True)
     init = commands.add_parser('init',
                                help='generates a kustomization directory')
     init.set_defaults(func=cmd_init)
     init.add_argument('name', type=name_type, help='name of the capture')
-
-    tasks = commands.add_parser('tasks', aliases=['t', 'task'],
-                                parents=[nodes],
-                                help='working with tasks')
-    tasks.set_defaults(func=cmd_tasks)
-    tasks.add_argument('-t', '--task',
-                       help='task name or pattern, must configre for stop')
-    tasks.add_argument('-r', '--regex', action='store_true',
-                       help='filter task name with regular expression')
-    tasks.add_argument('-s', '--stop', help='stop tasks')
-    artifacts = commands.add_parser('artifacts', aliases=['a', 'artifact'],
-                                    parents=[nodes],
-                                    help='working with artifacts')
-    artifacts.add_argument('-c', '--copy', type=Path,
-                           help='copy all artifacts to given directory')
-    send = commands.add_parser('send',
-                               parents=[nodes],
-                               help='send event to nodes')
+    anykap.make_hq_replserver_parser(parser, parents=[nodes])
     # we only parse known args, all unknown args are forwarded to kubectl
     # unless someone spot a reason we shouldn't do this
     args, kubectl_args = parser.parse_known_args()

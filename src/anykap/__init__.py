@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal, NewType
 from dataclasses import dataclass, field, make_dataclass, asdict
-from collections import defaultdict
+from collections import defaultdict, UserDict, Counter, deque
 import os
 from pathlib import Path
 import itertools as it
@@ -16,7 +16,6 @@ import shutil
 import time
 import shlex
 import argparse
-import io
 import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -93,6 +92,42 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout,
             else:
                 logger.warning('kill interrupted')
 
+
+class Milestones(UserDict):
+    def add(self, name):
+        self.data[name] = datetime.datetime.now(datetime.timezone.utc)
+
+
+class LastLogs(logging.Handler):
+    """save a few logs for visual cue"""
+    def __init__(self, data:deque, level=logging.WARNING):
+        super().__init__(level=level)
+        self.data = data
+        self.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s %(message)s'))
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+        self.data.append(msg)
+
+
+def json_default(o):
+    if isinstance(o, deque):
+        return list(o)
+    elif isinstance(o, UserDict):
+        return o.data
+    elif isinstance(o, datetime.datetime):
+        return o.strftime('%Y-%m-%d %H:%M:%S.%f')
+    elif isinstance(o, Path):
+        return str(o)
+    raise TypeError(f'unable to convert {o!r} to json')
+
+
 # -------------
 # Core Concepts
 # -------------
@@ -101,15 +136,14 @@ EventProcessor=NewType('EventProcessor', Callable[[Event], None])
 EventFilter=NewType('EventFilter', Callable[[Event], bool])
 EventMutator=NewType('EventMutator', Callable[[Event], Any])
 
-@dataclass(init=False, eq=False)
 class Receptor:
     """
     Receptor is a EventProcessor with a list of conditions.
     Conditions can be added to decide whether the testing event is subscribed.
     """
-    conditions:list[tuple[EventFilter, Optional[EventMutator]]]
     def __init__(self):
         self.conditions = []
+        self.count = 0
         self.logger = logger.getChild(self.__class__.__name__)
 
     def add_condition(self,
@@ -142,7 +176,7 @@ class Receptor:
                         'failed when calling mutator %r on event %r',
                         mutator, event)
                     return
-
+            self.count += 1  # count times we fire
             self.send(mutation_result)
             break  # first match wins
 
@@ -223,12 +257,10 @@ class Artifact:
     path:Path
     keep:bool = True
     context:Any = None
-    milestones:dict[str, datetime.datetime] = field(default_factory=dict)
+    milestones:Milestones = field(default_factory=Milestones)
     # lifecycle
     state:str = 'created'
     upload_state:Optional[str] = None
-    upload_attempts:int = 0
-    last_upload_failure:Optional[Exception] = None
     upload_url:Optional[str] = None
 
     def __post_init__(self):
@@ -237,11 +269,11 @@ class Artifact:
 
     def mark_state(self, state):
         self.state = state
-        self.milestones[state] = datetime.datetime.utcnow()
+        self.milestones.add(state)
 
     def mark_upload_state(self, state):
         self.upload_state = state
-        self.milestones[state] = datetime.datetime.utcnow()
+        self.milestones.add(state)
 
     def upload_complete(self, upload_url):
         self.upload_url = upload_url
@@ -277,19 +309,29 @@ class Artifact:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.complete()
 
+    def asdict(self):
+        """return a json friendly representation"""
+        return asdict(self)
+
 
 task_dataclass = dataclass(eq=False, unsafe_hash=False)
 
 _TaskBase = make_dataclass('Task', [
         ('name', Optional[str], None),
-        ('receptors', dict[str, Receptor], field(init=False)),
-        ('running', bool, field(init=False)),
-        ('exiting', bool, field(init=False)),
+        # ('receptors', dict[str, Receptor], field(init=False)),
+        # ('running', bool, field(init=False)),
+        # ('exiting', bool, field(init=False)),
+        # ('counter', dict[str, int], field(init=False, default_factory=Counter)),
+        ('milestones', Milestones,
+         field(init=False, default_factory=Milestones)),
+        ('warnings', list[str],
+         field(init=False, default_factory=lambda: deque(maxlen=3))),
     ], eq=False, unsafe_hash=False,
     namespace={'__post_init__': lambda self: None},
 )
 
 class Task(_TaskBase):
+    # XXX: milestones, counters, recent events, recent warnings
     counterdict = defaultdict(it.count)
     def __post_init__(self):
         super().__post_init__()
@@ -304,11 +346,11 @@ class Task(_TaskBase):
 
         # each task can have fixed number of receptors to subscribe events
         self.receptors = {'exit': FutureReceptor()}
-
         self.logger = logger.getChild(
             self.__class__.__name__).getChild(self.name)
-
+        self.logger.addHandler(LastLogs(self.warnings))
         self._task = None
+        self.milestones.add('created')
 
     @property
     def running(self):
@@ -335,16 +377,19 @@ class Task(_TaskBase):
                                        name=f'{self.name}-run_task')
         wait_exit_task = asyncio.create_task(self.wait_exit(),
                                              name=f'{self.name}-wait_exit')
+        self.milestones.add('started')
         done, pending = await asyncio.wait([run_task, wait_exit_task],
                                            return_when=asyncio.FIRST_COMPLETED)
         logger.debug('done: %s, pending: %s', done, pending)
         if wait_exit_task in done:
             assert run_task in pending
             run_task.cancel()
+            self.milestones.add('exited')
         else:
             assert run_task in done
             assert wait_exit_task in pending
             wait_exit_task.cancel()
+            self.milestones.add('completed')
 
         try:
             await wait_exit_task
@@ -355,8 +400,11 @@ class Task(_TaskBase):
             await run_task
         except asyncio.CancelledError:
             self.logger.info('task %s canceled', self.name)
+            self.milestones.add('canceled')
         except Exception:
             self.logger.exception('task %s encountered error', self.name)
+            self.milestones.add('failed')
+            # XXX: set exceptions as property for repl exposure
 
     async def run_task(self, hq):
         raise NotImplementedError
@@ -377,6 +425,15 @@ class Task(_TaskBase):
         # only call this after start
         if self._task and not self._task.done():
             await self._task
+
+    def asdict(self):
+        result = asdict(self)
+        result['receptor_counts'] = dict((k, v.count)
+                                         for k, v in self.receptors.items())
+        result['running'] = self.running
+        result['exiting'] = self.exiting
+        return result
+
 
 class HQ:
     """
@@ -637,7 +694,10 @@ class ShellTask(Task):
             finally:
                 # the subprocess should already be canceled
                 result = p.returncode
-                logger.info(f'script exit code: {result!r}')
+                level = logging.INFO
+                if result != 0:
+                    level = logging.WARNING
+                logger.log(level, f'script exit code: %r', result)
                 (artifact.path / self.result_file).write_text(str(result))
                 self.send_event(hq, 
                     {
@@ -880,37 +940,64 @@ class REPLServer(Task):
         raise NotImplementedError
 
 
-class HQREPLServer(REPLServer):
-    TASK_KEYS = ['name', 'running', 'exiting']
-    ARTIFACT_KEYS = ['name', 'state', 'path', 'upload_state', 'upload_url']
+def make_hq_replserver_parser(parser, parents=None):
+    """we capture this as a function so can be shared with client"""
+    parents = parents or []
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    # common options for task and artifact
+    common = type(parser)(add_help=False)
+    common.add_argument('-r', '--regex', action='store_true',
+                        help='filter name with regular expression')
+    common.add_argument('-a', '--all', action='store_true',
+                        help='show all items')
+    common.add_argument('name', nargs='*', help='specify names')
+    info = subparsers.add_parser('info', aliases=['i'], parents=parents)
+    tasks = subparsers.add_parser(
+        'tasks', aliases=['t', 'task'], help='task management',
+        parents=parents + [common])
+    tasks.add_argument('-s', '--stop', action='store_true',
+                        help='stop tasks if provided, otherwise list tasks')
+    # tasks.add_argument('--show-stopped', action='store_true',
+    #                     help='show stopped tasks as well')
+    artifacts = subparsers.add_parser(
+        'artifacts', aliases=['a', 'artifact'], help='artifact management',
+        parents=parents + [common])
+    # artifacts.add_argument('--show-incomplete', action='store_true',
+    #                        help='show incomplete artifacts as well')
+    artifacts.add_argument('--mark-uploaded', action='store_true',
+                           help='mark completed artifacts as uploaded')
+    send = subparsers.add_parser(
+        'send', help='send a event to hq', parents=parents)
+    send.add_argument('event', type=json.loads, help='event in json')
+    return {
+        'info': info,
+        'tasks': tasks,
+        'artifacts': artifacts,
+        'send': send,
+    }
 
+class HQREPLServer(REPLServer):
+    TASK_KEYS = ['name', 'running', 'exiting', 'milestones', 'warnings']
+    ARTIFACT_KEYS = ['name', 'state', 'path', 'upload_state', 'upload_url']
+    JSON_KW = {
+        'separators': (',', ':'),
+        'default': json_default,
+    }
     def __init__(self, path=None, *args, **kwargs):
         if path is None:
             path = os.environ.get('ANYKAP_SERVERPATH', 'repl.sock')
         super().__init__(path, *args, **kwargs)
         parser = REPLArgumentParser(prog=self.name)
-        subparsers = parser.add_subparsers(dest='command', required=True)
-        info = subparsers.add_parser('info', aliases=['i'])
-        info.set_defaults(func=self.cmd_info)
-        tasks = subparsers.add_parser(
-            'tasks', aliases=['t', 'task'], help='task management')
-        tasks.set_defaults(func=self.cmd_tasks)
-        tasks.add_argument('-s', '--stop', action='store_true',
-                           help='stop tasks if provided, otherwise list tasks')
-        tasks.add_argument('-r', '--regex', action='store_true',
-                           help='filter task name with regular expression')
-        tasks.add_argument('-a', '--all', action='store_true',
-                           help='show all tasks, including stopped')
-        tasks.add_argument('name', nargs='*',
-                           help='task name or pattern, must exist for stop')
-        artifacts = subparsers.add_parser(
-            'artifacts', aliases=['a', 'artifact'], help='artifact management')
-        
-        artifacts.set_defaults(func=self.cmd_artifacts)
-        # artifacts.add_argument('', help='')
-        send = subparsers.add_parser('send', help='send a event to hq')
-        send.add_argument('event', type=json.loads, help='event in json')
-        send.set_defaults(func=self.cmd_send)
+        parser.add_argument('-o', '--output', default='text',
+                            choices=['text', 'json'],
+                            help='switching output format')
+        commands = make_hq_replserver_parser(parser)
+        commands['info'].set_defaults(func=self.cmd_info)
+        commands['tasks'].set_defaults(
+            func=self.cmd_tasks, keys=self.TASK_KEYS)
+        commands['artifacts'].set_defaults(
+            func=self.cmd_artifacts, keys=self.ARTIFACT_KEYS)
+        commands['send'].set_defaults(func=self.cmd_send)
         self.parser = parser
 
     async def run_task(self, hq):
@@ -923,6 +1010,18 @@ class HQREPLServer(REPLServer):
         self.logger.debug('args: %r', args)
         return args.func(args)
 
+    def format_results(self, args, results):
+        if args.output == 'json':
+            resultdict = {'items': [item.asdict() for item in results]}
+            return [json.dumps(resultdict, **self.JSON_KW)]
+        else:
+            assert args.output == 'text'
+            lines = ['\t'.join(args.keys)]
+            dicts = [item.asdict() for item in results]
+            lines.extend('\t'.join(json.dumps(d.get(k, None), **self.JSON_KW)
+                                   for k in args.keys) for d in dicts)
+            return lines
+
     def cmd_tasks(self, args):
         if not args.name and args.stop:
             self.parser.error('task name must exist for stop')
@@ -930,32 +1029,36 @@ class HQREPLServer(REPLServer):
         if args.all and not args.stop:
             tasks += self.hq.done_tasks
         else:
-            tasks = list(task for task in tasks if task.running)
+            tasks = list(t for t in tasks if t.running)
 
         if args.name:
             if args.regex:
                 patterns = list(map(re.compile, args.name))
-                tasks = list(task for task in tasks
-                             if any(pattern.search(task.name)
+                tasks = list(t for t in tasks
+                             if any(pattern.search(t.name)
                                     for pattern in patterns))
             else:
-                tasks = [task for task in tasks if task.name in args.name]
+                tasks = [t for t in tasks if t.name in args.name]
         if args.stop:
-            tasks = list(task for task in tasks if not task.need_exit())
-            for task in tasks:
-                task.exit()
-
-        result = ['\t'.join(self.TASK_KEYS)]
-        result.extend('\t'.join(str(d.get(k, '')) for k in self.TASK_KEYS)
-                      for d in map(asdict, tasks))
-        return result
+            tasks = list(t for t in tasks if not t.need_exit())
+            for t in tasks:
+                t.exit()
+        return self.format_results(args, tasks)
 
     def cmd_artifacts(self, args):
         artifacts = list(self.hq.artifacts)
-        result = ['\t'.join(self.ARTIFACT_KEYS)]
-        result.extend('\t'.join(str(d.get(k, '')) for k in self.ARTIFACT_KEYS)
-                      for d in map(asdict, artifacts))
-        return result
+        if not args.all:
+            artifacts = [a for a in artifacts if a.state == 'completed']
+        if args.name:
+            if args.regex:
+                patterns = list(map(re.compile, args.name))
+                artifacts = list(a for a in artifacts
+                             if any(pattern.search(a.name)
+                                    for pattern in patterns))
+            else:
+                artifacts = [a for a in artifacts if a.name in args.name]
+
+        return self.format_results(args, artifacts)
 
     def cmd_send(self, args):
         event = args.event
