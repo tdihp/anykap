@@ -157,13 +157,13 @@ class AzureBlobUploader(Uploader):
         size = path.stat().st_size  
         with path.open('rb') as f:
             # https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob
+            now = datetime.datetime.now(datetime.timezone.utc)
             request = urllib.request.Request(
                 url=upload_url, method="PUT", data=f, headers={
                     'Content-Length': str(size),
                     'Content-Type': 'application/octet-stream',
                     'User-Agent': USER_AGENT,
-                    'Date': datetime.datetime.utcnow().strftime(
-                        '%a, %d %b %Y %H:%M:%S GMT'),
+                    'Date': now.strftime('%a, %d %b %Y %H:%M:%S GMT'),
                     'x-ms-version': '2023-11-03',
                     'x-ms-blob-type': 'BlockBlob',
                 })

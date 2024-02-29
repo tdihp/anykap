@@ -94,13 +94,14 @@ def blob_container(azurite, shared_key, storage_account):
         initial_backoff=1,
         increment_base=0.9)
     container_name = 'foobar' # we use a hard coded container for test now
+    now = datetime.datetime.now(datetime.timezone.utc)
     sas = generate_container_sas(
         account_name=storage_account,
         container_name=container_name,
         account_key=shared_key,
         permission='racw',
-        start=datetime.datetime.utcnow(),
-        expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=1),
+        start=now,
+        expiry=now + datetime.timedelta(hours=1),
     )
 
     with blob_service_client:

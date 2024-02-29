@@ -17,4 +17,4 @@ async def test_exception(hq, hqtask):
     hq.add_task(task)
     task._task.add_done_callback(lambda task: called.set_result(True))
     await asyncio.wait_for(called, timeout=1)
-
+    assert len(task.warnings) == 1 and 'oops' in task.warnings[0]

@@ -29,7 +29,7 @@ async def test_periodic_task(hq, hqtask):
     await done
     diff = [a - b for b, a in  zip(output[:-1], output[1:])]
     print(diff)
-    assert diff == pytest.approx([0.28, 0.4, 0.5, 0.01], rel=0.2)
+    assert diff == pytest.approx([0.28, 0.4, 0.5, 0.01], abs=0.05)
 
 
 async def test_cridiscovery(hq, hqtask):

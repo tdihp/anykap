@@ -128,6 +128,24 @@ def json_default(o):
     raise TypeError(f'unable to convert {o!r} to json')
 
 
+class OptionalLoggerMixin:
+    """Optional logger property that defaults to the root logger"""
+    @property
+    def logger(self):
+        if hasattr(self, '_logger') and self._logger:
+            return self._logger
+        global logger
+        return logger
+
+    @logger.setter
+    def logger(self, v):
+        if v:
+            self._logger = v
+            self.set_logger(v)
+
+    def set_logger(self, v):
+        pass
+
 # -------------
 # Core Concepts
 # -------------
@@ -136,49 +154,108 @@ EventProcessor=NewType('EventProcessor', Callable[[Event], None])
 EventFilter=NewType('EventFilter', Callable[[Event], bool])
 EventMutator=NewType('EventMutator', Callable[[Event], Any])
 
-class Receptor:
+
+class SimpleRule(OptionalLoggerMixin):
+    """ A rule structure with a single filter and optional mutator and action.
+    If only filter provided, this degrades to returning event if filter passes.
+    If mutator is provided, this returns mutator(event) if filter passes.
+    if action is provided, action is called on the optionally mutated event.
+    if filter doesn't pass, it returns None.
+    count is increased if event passes both filter and mutator.
+    """
+    def __init__(self,
+                 filter:EventFilter=None,
+                 mutator:EventMutator=None,
+                 action:EventProcessor=None,
+                 logger=None):
+        self.count = 0
+        self.logger = logger
+        if filter:
+            if not callable(filter):
+                raise ValueError(f'filter {filter!r} not callable')
+            self.filter = filter
+        if not hasattr(self, 'filter'):
+            raise ValueError('filter not provided for SimpleRule')
+        if mutator:
+            if not callable(mutator):
+                raise ValueError(f'mutator {mutator!r} not callable')
+            self.mutator = mutator
+        if action:
+            if not callable(mutator):
+                raise ValueError(f'action {action!r} not callable')
+            self.action = action
+
+    def __call__(self, event):
+        logger = self.logger
+        try:
+            if not self.filter(event):
+                return None
+        except Exception:
+            logger.exception('failed when calling filter %s on event %s',
+                             self.filter, event)
+            return None
+
+        if hasattr(self, 'mutator'):
+            try:
+                event = self.mutator(event)
+            except Exception:
+                logger.exception('failed when calling mutator %s on event %s',
+                                 self.mutator, event)
+                return None
+        self.count += 1
+        if hasattr(self, 'action'):
+            self.action(event)
+        return event
+
+
+class CompoundRule(OptionalLoggerMixin):
+    """ compound rule evaluates its rules list from the first one,
+    stops if any of the rule doesn't return None, then call the optional action
+    any exceptions stops the rule chain.
+    """
+    def __init__(self, action=None, logger=None):
+        self.count = 0
+        self.rules = []
+        if action:
+            self.action = action
+        self.logger = logger
+
+    def add_rule(self, rule:EventMutator):
+        if isinstance(rule, OptionalLoggerMixin):
+            # always override logger
+            rule.logger = self.logger
+        self.rules.append(rule)
+
+    def set_logger(self, v):
+        for rule in self.rules:
+            if isinstance(rule, OptionalLoggerMixin):
+                rule.logger = v
+
+    def __call__(self, event):
+        logger = self.logger
+        for rule in self.rules:
+            try:
+                result = rule(event)
+            except Exception:
+                logger.exception(
+                    'calling rule %s triggered exception, quitting', rule)
+                return None
+
+            if result is None:
+                continue
+            self.count += 1
+            if hasattr(self, 'action'):
+                self.action(result)
+            return result
+
+
+class Receptor(CompoundRule):
     """
     Receptor is a EventProcessor with a list of conditions.
     Conditions can be added to decide whether the testing event is subscribed.
     """
-    def __init__(self):
-        self.conditions = []
-        self.count = 0
-        self.logger = logger.getChild(self.__class__.__name__)
-
-    def add_condition(self,
-                      filter_:EventFilter,
-                      mutator:Optional[EventMutator]=None,
-                      ):
-        if not callable(filter_):
-            raise ValueError(f'provided filter {filter_!r} not callable')
-        if mutator and not callable(mutator):
-            raise ValueError(f'provided mutator {mutator!r} not callable')
-        self.conditions.append((filter_, mutator))
-
-    def __call__(self, event:dict):
-        for filter_, mutator in self.conditions:
-            try:
-                if not filter_(event):
-                    return
-            except Exception:
-                self.logger.exception(
-                    'failed when calling filter %r on event %r',
-                    filter_, event)
-                return
-
-            mutation_result = event
-            if mutator:
-                try:
-                    mutation_result = mutator(event)
-                except Exception:
-                    self.logger.exception(
-                        'failed when calling mutator %r on event %r',
-                        mutator, event)
-                    return
-            self.count += 1  # count times we fire
-            self.send(mutation_result)
-            break  # first match wins
+    def action(self, event):
+        self.send(event)
 
     def send(self, event:Any):
         # send should never block
@@ -195,8 +272,8 @@ class Receptor:
 class FutureReceptor(Receptor):
     """ a future -> value receptor, only wait once,
     typical for exit receptor """
-    def __init__(self, initial_value=False):
-        super().__init__()
+    def __init__(self, initial_value=False, **kwargs):
+        super().__init__(**kwargs)
         # self.future = asyncio.Future()
         self._waiters = set()
         self.value = initial_value
@@ -227,8 +304,8 @@ class FutureReceptor(Receptor):
 
 
 class QueueReceptor(Receptor):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.queue = queue.Queue()
 
     def send(self, event):
@@ -345,9 +422,9 @@ class Task(_TaskBase):
                 f"given name {self.name} is not valid, please sanitize first")
 
         # each task can have fixed number of receptors to subscribe events
-        self.receptors = {'exit': FutureReceptor()}
         self.logger = logger.getChild(
             self.__class__.__name__).getChild(self.name)
+        self.receptors = {'exit': FutureReceptor(logger=self.logger)}
         self.logger.addHandler(LastLogs(self.warnings))
         self._task = None
         self.milestones.add('created')
@@ -549,6 +626,8 @@ class HQ:
             task.start(self)
 
     def add_rule(self, rule):
+        if isinstance(rule, OptionalLoggerMixin):
+            rule.logger = self.logger
         self.rules.append(rule)
 
     def send_event(self, event:dict):
@@ -1095,7 +1174,7 @@ class ArtifactManager(Task):
     def __init__(self, archiver, uploader, name='artifact-manager',):
         super().__init__(name=name)
         self.receptors['artifact'] = QueueReceptor()
-        self.receptors['artifact'].add_condition(self.filter_event)
+        self.receptors['artifact'].add_rule(SimpleRule(self.filter_event))
         self.uploader = uploader
         self.archiver = archiver
         self.executor = ThreadPoolExecutor()
@@ -1535,6 +1614,118 @@ class PodContainerDiscovery(PeriodicTask):
         self._container_discovery.filter = \
             lambda item: item.podSandboxId in pod_ids
         await self._container_discovery.run_once(hq)
+
+# -------------
+# Utility rules
+#--------------
+
+def _validate_period(v:Union[float,datetime.timedelta]):
+    """converts optional timedelta to seconds, must be larger than 0"""
+    if isinstance(v, datetime.timedelta):
+        v = v.total_seconds()
+    if not isinstance(v, (int, float)):
+        raise ValueError(f'invalid time period {v!r}')
+    if v <= 0:
+        raise ValueError(f'time period must be positive, got {v}')
+    return v
+
+class DelayRule(SimpleRule):
+    """ Generates a new event if a given event triggers.
+    Duplcated triggering events are aggregated to a single event.
+    Structure of the fired event will be:
+    {
+        "kind": "delay",
+        "name": "{self.name}",
+        "first_event": <original-event>
+        "first_seen": datetime,
+        "last_seen": datetime,
+        "count": 1,
+    }
+    An optional throttle period can be provided, to block events after a flush.
+    """
+    def __init__(self, hq:HQ, name:str, delay:Union[float,datetime.timedelta],
+                 *args, throttle:Union[float,datetime.timedelta]=None,
+                 action=None, **kwargs):
+        if action:
+            raise ValueError('action is specialized in DelayRule')
+        super().__init__(*args, **kwargs)
+        self.hq = hq
+        self.name = name
+        self.delay = _validate_period(delay)
+        if throttle:
+            self.throttle = _validate_period(throttle)
+        self.throttle_until = None
+        self.throttle_count = 0
+        self.current_event = None
+
+    def flush(self):
+        if self.current_event:
+            logger.debug('flushing current event')
+            self.hq.send_event(self.current_event)
+            self.current_event = None
+
+    def action(self, event):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if not self.current_event:
+            if self.throttle_until and now < self.throttle_until:
+                self.throttle_count += 1
+                return
+            self.logger.debug('new event triggered delay')
+            self.current_event = {
+                'kind': 'delay',
+                'name': self.name,
+                'first_event': event,
+                'first_seen': now,
+                'last_seen': now,
+                'count': 1,
+            }
+            asyncio.get_running_loop().call_later(
+                self.delay,
+                self.flush)
+            if self.throttle:
+                self.throttle_until = now + datetime.timedelta(
+                    seconds=self.delay + self.throttle)
+            return
+
+        current_event = self.current_event
+        assert current_event
+        current_event['count'] += 1
+        current_event['last_seen'] = now
+
+
+class FissionRule(SimpleRule):
+    """
+    templating method for creating & adding new tasks
+    """
+    def __init__(self, hq, task_factory,
+                 *args, name=None, action=None, **kwargs):
+        if action:
+            raise ValueError('action is specialized in FissionRule')
+        super().__init__(*args, **kwargs)
+        self.hq = hq
+        self.name = name
+        self.task_factory = task_factory
+        self.counter = it.count(1)
+        self.logger = logger.getChild(self.__class__.__name__)
+
+    def next_task_name(self):
+        return '-'.join(self.name + next(self.counter))
+
+    def action(self, event):
+        if not isinstance(event, dict):
+            raise ValueError('mutator of FissionRule must be a dict')
+
+        params = event.copy()
+        if self.name:
+            params.setdefault('name',
+                              '-'.join([self.name, str(next(self.counter))]))
+
+        new_task = self.task_factory(**params)
+        if not isinstance(new_task, Task):
+            raise ValueError(f'factory {self.task_factory!r} '
+                             f'generated non-task {new_task!r}')
+
+        self.hq.add_task(new_task)
 
 
 def main(hq):

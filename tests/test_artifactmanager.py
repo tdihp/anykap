@@ -1,9 +1,11 @@
 import sys
 from inspect import getsource
 import zipfile
+import pytest
 from anykap import *
 
 
+# @pytest.mark.skip
 async def test_artifactmanager_working(hq, hqtask,tmp_path):
     dest = tmp_path / 'dest'
     dest.mkdir()
