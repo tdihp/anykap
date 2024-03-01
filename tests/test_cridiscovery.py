@@ -51,7 +51,7 @@ async def test_cridiscovery(hq, hqtask):
             return args
         run_crictl = mock
 
-    mytask = CRIDiscovery(CRIDummy, cadence=0.1, namespace='foobar')
+    mytask = CRIDiscovery(CRIDummy, cadence=0.1, query=dict(namespace='foobar'))
     crictl_outputs = [
         {'items': [{'id': 'item1',}]},
         {'items': [{'id': 'item1',}]},

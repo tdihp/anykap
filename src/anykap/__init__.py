@@ -65,9 +65,8 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout,
         if p.returncode != None:
             return
 
-        logger.warning('tearing down subprocess %r with timeouts %s and %s',
+        logger.info('tearing down subprocess %r with timeouts %s and %s',
                        p, terminate_timeout, kill_timeout)
-        logger.info('sending terminate')
         p.terminate()
         try:
             await asyncio.wait_for(p.wait(), timeout=terminate_timeout)
@@ -160,7 +159,7 @@ class SimpleRule(OptionalLoggerMixin):
     If only filter provided, this degrades to returning event if filter passes.
     If mutator is provided, this returns mutator(event) if filter passes.
     if action is provided, action is called on the optionally mutated event.
-    if filter doesn't pass, it returns None.
+    if filter doesn't pass, it returns either None or False.
     count is increased if event passes both filter and mutator.
     """
     def __init__(self,
@@ -241,12 +240,13 @@ class CompoundRule(OptionalLoggerMixin):
                     'calling rule %s triggered exception, quitting', rule)
                 return None
 
-            if result is None:
+            if result is None or result is False:
                 continue
             self.count += 1
             if hasattr(self, 'action'):
                 self.action(result)
             return result
+        return None  # no rule successful
 
 
 class Receptor(CompoundRule):
@@ -736,6 +736,7 @@ class ShellTask(Task):
             p = await asyncio.subprocess.create_subprocess_exec(
                 *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
+                **self.popen_kw,
             )
             notify_tasks = []
             if self.stdout_mode == 'notify':
@@ -1544,12 +1545,12 @@ class PeriodicTask(Task):
 class CRIDiscovery(PeriodicTask):
     """basic CRI discovery"""
     def __init__(self, datacls:Type[CRICtlData], name=None, cadence=30,
-                 timeout=30, inspect=False, **query):
+                 timeout=30, inspect=False, query=None):
         super().__init__(name=name, cadence=cadence, timeout=timeout)
         self.datacls = datacls
         self.cadence = cadence
         self.inspect = inspect
-        self.query = query
+        self.query = query or {}
         self.watching = set()
 
     def get_watching(self):
@@ -1604,9 +1605,9 @@ class PodContainerDiscovery(PeriodicTask):
                  name=None, cadence=30,
                  inspect_pod=False, inspect_container=False):
         super().__init__(name=name, cadence=cadence)
-        self._pod_discovery = PodDiscovery(inspect=inspect_pod, **pod_query)
+        self._pod_discovery = PodDiscovery(inspect=inspect_pod, query=pod_query)
         self._container_discovery = ContainerDiscovery(
-            inspect=inspect_container, **container_query)
+            inspect=inspect_container, query=container_query)
 
     async def run_once(self, hq):
         await self._pod_discovery.run_once(hq)
