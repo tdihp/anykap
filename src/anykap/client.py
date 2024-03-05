@@ -11,8 +11,6 @@ import json
 import shlex
 from pathlib import Path, PosixPath
 from importlib import resources as impresources
-from collections import namedtuple
-import packaging.version
 import warnings
 import pprint
 import logging
@@ -144,8 +142,7 @@ def get_metadata(parser, args):
     result = dict((k.removeprefix('anykap/'), v)
                 for k, v in annotations.items() if k.startswith('anykap/'))
     version = result.get('version')
-    if (not version or (packaging.version.parse(version)
-                        != packaging.version.parse(anykap.__version__))):
+    if (not version or version != anykap.__version__):
         warnings.warn('workspace created with different anykap version '
                       f'{version}, current anykap version {anykap.__version__}')
     return result
