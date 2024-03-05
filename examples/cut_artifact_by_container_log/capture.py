@@ -3,10 +3,10 @@ from anykap import *
 from datetime import timedelta
 from functools import partial
 hq = HQ()
-
+e = SugarStub()
 # used for communication
 hq.add_task(HQREPLServer())
-hq.add_task(PodContainerDiscovery(
+discovery = hq.add_task(PodContainerDiscovery(
     pod_query={
         'labels': ['application=contoso'],
         'name': 'contoso',  # crictl pods --name supports regular expression
@@ -16,18 +16,10 @@ hq.add_task(PodContainerDiscovery(
     # inspect_pod=True,  # if we want crictl inspectp output
     # inspect_container=True,  # if we want crictl inspect output
 ))
-hq.add_rule(FissionRule(
+fission_rule = hq.add_rule(FissionRule(
+    discovery[e.topic == 'new', e.objtype == 'container', {'env': {'container_id': e.object.id}}],
     hq,
     name='errorgrep',
-    filter=lambda event: (event.get('kind') == 'discovery'
-                          and event['topic'] == 'new'
-                          and event['objtype'] == 'container'),
-    mutator=lambda event: {
-        'popen_kw':{
-            'env': {
-                # use envrionment variavle to send parameters to script, https://xkcd.com/327/!
-                'container_id': event['object'].id,
-            }}},
     task_factory=partial(
         ShellTask,
         keep_artifact=False,
@@ -38,10 +30,10 @@ hq.add_rule(FissionRule(
     )
 ))
 
-hq.add_rule(DelayRule(
+delay_rule = hq.add_rule(DelayRule(
+    fission_rule[e.kind == 'shell', e.topic == 'line'],
     hq, 'errorgrep',
     delay=timedelta(minutes=1),  # we delay for 1 minute to catch more problems
-    filter=lambda event: event.get('kind') == 'shell' and event['topic'] == 'line' and event['task_name'].startswith('errorgrep'),
     # we throttle for 3 more minutes to avoid frequent bumps
     throttle=timedelta(minutes=3),
 ))
@@ -52,14 +44,15 @@ def tcpdump_factory(**config):
         script=r'chmod 777 .; tcpdump -iany -C10 -W6 -w "out.pcap" port 53',
         **config
     )
-    task.receptors['exit'].add_rule(lambda event: event.get('kind') == 'delay' and event['name'] == 'errorgrep')
+    # this is the current recommended way to update receptor if receptors needs
+    # to be changed on task creation
+    task.receptors['exit'].add_filter(delay_rule.getfilter())
     return task
 
 hq.add_rule(FissionRule(
+    delay_rule.getfilter().chain({}),  # chain({}) makes sure no args sent to factory 
     hq,
     name='tcpdump',
-    filter=lambda event: event.get('kind') == 'errorgrep',
-    mutator=lambda event: {},  # we don't need event data in factory
     task_factory=tcpdump_factory,
 ))
 # the initial tcpdump capture before any trigger

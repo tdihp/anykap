@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal, NewType
 from dataclasses import dataclass, field, make_dataclass, asdict
 from collections import defaultdict, UserDict, Counter, deque
+from collections.abc import Sequence, Mapping
 import os
 from pathlib import Path
 import itertools as it
@@ -18,6 +19,7 @@ import shlex
 import argparse
 import json
 import tempfile
+import operator
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
@@ -124,6 +126,8 @@ def json_default(o):
         return o.strftime('%Y-%m-%d %H:%M:%S.%f')
     elif isinstance(o, Path):
         return str(o)
+    elif isinstance(o, CRICtlData):
+        return o.asdict()
     raise TypeError(f'unable to convert {o!r} to json')
 
 
@@ -154,111 +158,357 @@ EventFilter=NewType('EventFilter', Callable[[Event], bool])
 EventMutator=NewType('EventMutator', Callable[[Event], Any])
 
 
-class SimpleRule(OptionalLoggerMixin):
-    """ A rule structure with a single filter and optional mutator and action.
-    If only filter provided, this degrades to returning event if filter passes.
-    If mutator is provided, this returns mutator(event) if filter passes.
-    if action is provided, action is called on the optionally mutated event.
-    if filter doesn't pass, it returns either None or False.
-    count is increased if event passes both filter and mutator.
+class FilterBase:
     """
-    def __init__(self,
-                 filter:EventFilter=None,
-                 mutator:EventMutator=None,
-                 action:EventProcessor=None,
-                 logger=None):
-        self.count = 0
-        self.logger = logger
-        if filter:
-            if not callable(filter):
-                raise ValueError(f'filter {filter!r} not callable')
-            self.filter = filter
-        if not hasattr(self, 'filter'):
-            raise ValueError('filter not provided for SimpleRule')
+    Filter is an abstraction of a single arg callable. Anykap uses Filters to
+    work with events.
+    Filters are callables that takes a single input event,
+    and returns (verdict, mutated).
+    Filters can be "chained" together by .chain(...) or build_filter(...),
+    to build alternating filters use AlternativeFilter() or the '|'
+    operator.
+    """
+    def chain(self, *args):
+        """ create a chained filter """
+        if not args:
+            raise ValueError('empty args for chain')
+        return build_filter(self, *args)
+
+    def __or__(self, other):
+        alts = []
+        for filter in [self, other]:
+            filter = build_filter(filter)
+            if isinstance(filter, AlternativeFilter):
+                alts.extend(filter._filters)
+            else:
+                alts.append(filter)
+        assert len(alts) >= 2
+        return AlternativeFilter(*alts)
+
+
+def build_filter(*args):
+    """build a filter according to given parameters.
+    If more than one parameters are given, all filters will be chained together.
+    In addition to all instances of FilterBase, this builder also accepts dicts
+    as a mutator, and SugarExp as a condition.
+    """
+    if not args:
+        raise ValueError('build_filter with empty args')
+    chain = []
+
+    for arg in args:
+        if isinstance(arg, FilterChain):
+            chain.extend(arg._filters)
+        elif isinstance(arg, FilterBase):
+            chain.append(arg)
+        elif isinstance(arg, SugarOp):
+            chain.append(Filter(condition=arg))
+        elif isinstance(arg, SugarLiteral):
+            chain.append(Filter(mutator=arg))
+        elif isinstance(arg, dict):
+            chain.append(Filter(mutator=SugarLiteral(arg)))
+        elif callable(arg):
+            chain.append(FilterWrapper(arg))
+        else:
+            raise ValueError(f'unable to process arg {arg!r} as a filter')
+
+    assert chain
+    if len(chain) == 1:
+        return chain[0]
+    return FilterChain(*chain)
+
+
+class Filter(FilterBase):
+    """A basic filter that takes a condition and a mutator.
+    """
+    def __init__(self, condition=None, mutator=None):
+        if condition:
+            if not callable(condition):
+                raise ValueError(f'condition {condition!r} not callable')
+            self.condition = condition
         if mutator:
             if not callable(mutator):
                 raise ValueError(f'mutator {mutator!r} not callable')
             self.mutator = mutator
-        if action:
-            if not callable(mutator):
-                raise ValueError(f'action {action!r} not callable')
-            self.action = action
+
+        if not hasattr(self, 'condition') and not hasattr(self, 'mutator'):
+            raise ValueError('none of condition and mutator provided')
 
     def __call__(self, event):
-        logger = self.logger
+        verdict = True
+        mutated = event
+        if hasattr(self, 'condition'):
+            verdict = self.condition(event)
+        if verdict and hasattr(self, 'mutator'):
+            mutated = self.mutator(event)
+        return verdict, mutated
+
+
+class FilterWrapper(FilterBase):
+    """Wraps a function a into a filter.
+    if return value of given function is None or False, then verdict is False.
+    Otherwise verdict is True and the return value is passed as-is
+    """
+    def __init__(self, f):
+        if not callable(f):
+            raise ValueError(f'provided f {f!r} is not callable')
+        self._f = f
+
+    def __call__(self, event):
+        result = self._f(event)
+        if result is None or result is False:
+            return False, None
+        return True, result
+
+
+class FilterChain(FilterBase):
+    """chained filters. use Filter.chain or build_filter to construct this"""
+    def __init__(self, *filters):
+        if not filters:
+            raise ValueError('empty chain')
+        self._filters = tuple(filters)
+        if not all(isinstance(filter, FilterBase) for filter in self._filters):
+            raise ValueError(f'not all filters FilterBase: {self._filters!r}')
+
+    def __call__(self, event):
+        verdict = False
+        mutated = event
+        for filter in self._filters:
+            verdict, mutated = filter(mutated)
+            if not verdict:
+                return False, None
+        return verdict, mutated
+
+
+class AlternativeFilter(FilterBase):
+    """build alternatives
+    This filter doesn't process exceptions for any of the filters given,
+    user need to make sure all alternatives doesn't raise exceptions
+    """
+    def __init__(self, *filters:FilterBase):
+        self._filters = []
+        for filter in filters:
+            self.add_filter(filter)
+
+    def add_filter(self, *args):
+        filter = build_filter(*args)
+        if isinstance(filter, AlternativeFilter):
+            self._filters.extend(filter._filters)
+        else:
+            self._filters.append(filter)
+
+    def __call__(self, event):
+        for filter in self._filters:
+            verdict, mutated = filter(event)
+            if verdict:
+                return verdict, mutated
+        return False, None
+
+
+class SugarExp:
+    """Parent class of EventStub, EventOperation and LiteralMutator
+    All those classes combine to form the syntax sugar of rule composition.
+    """
+    #  https://docs.python.org/3/reference/expressions.html#operator-precedence
+    EXP_OPERATORS = {
+        # Due to boolean and or are implemented by __bool__() which requires
+        # a boolean outcome, the approach here only works for a restricted
+        # setting.
+        # '__not__': ('~',  1, 4),
+        # '__and__': ('&',  2, 8),
+        # '__or__':  ('|',  2, 10),
+        '__lt__':  ('<',  2, 11),
+        '__le__':  ('<=', 2, 11),
+        '__eq__':  ('==', 2, 11),
+        '__ne__':  ('!=', 2, 11),
+        '__ge__':  ('>=', 2, 11),
+        '__gt__':  ('>',  2, 11),
+    }
+    @staticmethod
+    def _exp_method(op):
+        def method(self, *args):
+            return SugarOp(op, self, *args)
+        return method
+
+    for opname in EXP_OPERATORS:
+        # workaround needed in 3.9: https://stackoverflow.com/a/41921291/1000290
+        locals()[opname] = _exp_method.__func__(opname)
+
+    def _repr(self):
+        raise NotImplementedError
+
+    def __repr__(self):
+        return '{}({})'.format(self.__class__.__name__, self._repr())
+
+class SugarStub(SugarExp):
+    """generate a rule by access event properties
+    
+    e.g. e = EventStub()
+    """
+    @staticmethod
+    def _getitem(obj, key):
         try:
-            if not self.filter(event):
-                return None
-        except Exception:
-            logger.exception('failed when calling filter %s on event %s',
-                             self.filter, event)
+            return obj[key]
+        except (KeyError, IndexError, TypeError):
             return None
 
-        if hasattr(self, 'mutator'):
-            try:
-                event = self.mutator(event)
-            except Exception:
-                logger.exception('failed when calling mutator %s on event %s',
-                                 self.mutator, event)
-                return None
-        self.count += 1
-        if hasattr(self, 'action'):
-            self.action(event)
-        return event
+    
+    @staticmethod
+    def _getattr(obj, key):
+        return getattr(obj, key, None) or SugarStub._getitem(obj, key)
 
+    OPMAP = {
+        # workaround needed in 3.9: https://stackoverflow.com/a/41921291/1000290
+        'getitem': _getitem.__func__,
+        'getattr': _getattr.__func__,
+    }
+    REPRMAP = {
+        'getitem': '[{!r}]',
+        'getattr': '.{}',
+    }
 
-class CompoundRule(OptionalLoggerMixin):
-    """ compound rule evaluates its rules list from the first one,
-    stops if any of the rule doesn't return None, then call the optional action
-    any exceptions stops the rule chain.
-    """
-    def __init__(self, action=None, logger=None):
-        self.count = 0
-        self.rules = []
-        if action:
-            self.action = action
-        self.logger = logger
+    def __init__(self, stack=()):
+        self._stack = stack
 
-    def add_rule(self, rule:EventMutator):
-        if isinstance(rule, OptionalLoggerMixin):
-            # always override logger
-            rule.logger = self.logger
-        self.rules.append(rule)
+    def __getitem__(self, key):
+        if not isinstance(key, (str, int)):
+            raise KeyError(f'SugarStub only supports str and int keys')
+        return SugarStub(self._stack + (('getitem', key),))
 
-    def set_logger(self, v):
-        for rule in self.rules:
-            if isinstance(rule, OptionalLoggerMixin):
-                rule.logger = v
+    def __getattr__(self, key):
+        return SugarStub(self._stack + (('getattr', key),))
 
     def __call__(self, event):
-        logger = self.logger
-        for rule in self.rules:
-            try:
-                result = rule(event)
-            except Exception:
-                logger.exception(
-                    'calling rule %s triggered exception, quitting', rule)
-                return None
+        new_event = event
+        for op, key in self._stack:
+            new_event = self.OPMAP[op](new_event, key)
+        return new_event
 
-            if result is None or result is False:
-                continue
+    def __repr__(self):
+        visits = [self.REPRMAP[op].format(key) for op, key in self._stack]
+        return ''.join(['SugarStub()'] + visits)
+
+    _repr = __repr__
+
+class SugarOp(SugarExp):
+    """ communicate EventStubs with operators. User shouldn't construct this
+    class directly.
+    """
+    def __init__(self, op, *args):
+        if op not in self.EXP_OPERATORS:
+             raise ValueError(f'operator {op!r} not valid')
+        self._op = op
+        sym, cnt, prece = self.EXP_OPERATORS[op]
+        if len(args) != cnt:
+            raise ValueError(f'expecting {cnt} args for op {op}, got {args!r}')
+        args = tuple(arg if isinstance(arg, SugarExp) else SugarLiteral(arg)
+                     for arg in args)
+        self._args = args
+
+    def __call__(self, event):
+        return getattr(operator, self._op)(*(arg(event) for arg in self._args))
+
+    def _repr(self):
+        op = self._op
+        sym, cnt, prece = self.EXP_OPERATORS[op]
+        # we only wrap parentheses if
+        # 1) sub arg is also SugarOp,
+        # 2) sug arg has lower precedence (numeric wise higher)
+        argreprs = []
+        for arg in self._args:
+            argrepr = arg._repr()
+            if isinstance(arg, SugarOp):
+                _, _, argprece = self.EXP_OPERATORS[arg._op]
+                if argprece > prece:
+                    argrepr= f'({argrepr})'
+            argreprs.append(argrepr)
+        if cnt == 1:
+            return '{} {}'.format(sym, argreprs[0])
+        else:
+            assert cnt == 2
+            return '{} {} {}'.format(argreprs[0], sym, argreprs[1])
+
+
+class FilterMixin:
+    """provides a convention for getting filters from existing objects"""
+    def getfilter(self):
+        raise NotImplementedError
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            return self.getfilter().chain(*key)
+        return self.getfilter().chain(key)
+
+
+class SugarLiteral(SugarExp):
+    """Mutating given event by mixed literals with EventStubs
+    
+    Supported literals are:
+        Recursives: dict[str,any], list
+        Literals: True, False, None, int, float, str
+        SugarExp (only as child if recursives)
+
+    e.g. given a dict input, `LiteralMutator({'foo': e.bar})` evaluates the same
+    as `lambda e: {'foo': e.get('bar')}`.
+    """
+    @staticmethod
+    def _walk(obj, f):
+        if isinstance(obj, (bool, int, float, str)):
+            return obj
+        if obj is None:
+            return obj
+        if isinstance(obj, dict):
+            if not all(isinstance(k, str) for k in obj.keys()):
+                raise ValueError(f'non-str dict keys exists in {obj}')
+            return dict((k, SugarLiteral._walk(v, f))
+                        for k, v in obj.items())
+        if isinstance(obj, list):
+            return [SugarLiteral._walk(v, f) for v in obj]
+        if isinstance(obj, SugarExp):
+            return f(obj)
+        raise ValueError(f'invalid literal {obj!r}')
+
+    def __init__(self, obj):
+        if isinstance(obj, SugarExp):
+            raise ValueError(
+                f'initializing LiteralMutator with root SugarExp {obj!r}')
+        self._obj = self._walk(obj, lambda x: x)
+
+    def __call__(self, event):
+        return self._walk(self._obj, lambda x: x(event))
+
+    def _repr(self):
+        return repr(self._obj)
+
+
+class Rule:
+    """
+    Rule is composition of: a Filter and a Action.
+    Action is called if filter is successful. Action function should take 2
+    parameters: mutated and event. Event is the original event, in case needed.
+    """
+    filter:FilterBase
+    action:EventProcessor
+    count = 0
+
+    def __call__(self, event):
+        verdict, mutated = self.filter(event)
+        if verdict:
             self.count += 1
-            if hasattr(self, 'action'):
-                self.action(result)
-            return result
-        return None  # no rule successful
+            self.action(mutated, event)
 
 
-class Receptor(CompoundRule):
-    """
-    Receptor is a EventProcessor with a list of conditions.
-    Conditions can be added to decide whether the testing event is subscribed.
-    """
-    def action(self, event):
-        self.send(event)
+class Receptor(Rule):
+    def __init__(self, filters=None):
+        self.filter = AlternativeFilter(*(filters or []))
 
-    def send(self, event:Any):
-        # send should never block
+    def add_filter(self, *args):
+        self.filter.add_filter(*args)
+
+    def action(self, mutated, event):
+        self.send(mutated)
+
+    def send(self, event):
         raise NotImplementedError
 
     def get_nowait(self):
@@ -269,11 +519,12 @@ class Receptor(CompoundRule):
         """returns None if times out"""
         return self.get_nowait()
 
+
 class FutureReceptor(Receptor):
     """ a future -> value receptor, only wait once,
     typical for exit receptor """
-    def __init__(self, initial_value=False, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, filters=None, initial_value=False):
+        super().__init__(filters=filters)
         # self.future = asyncio.Future()
         self._waiters = set()
         self.value = initial_value
@@ -304,8 +555,8 @@ class FutureReceptor(Receptor):
 
 
 class QueueReceptor(Receptor):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, filters=None):
+        super().__init__(filters=filters)
         self.queue = queue.Queue()
 
     def send(self, event):
@@ -395,6 +646,7 @@ task_dataclass = dataclass(eq=False, unsafe_hash=False)
 
 _TaskBase = make_dataclass('Task', [
         ('name', Optional[str], None),
+        ('context', Any, None),
         # ('receptors', dict[str, Receptor], field(init=False)),
         # ('running', bool, field(init=False)),
         # ('exiting', bool, field(init=False)),
@@ -407,7 +659,11 @@ _TaskBase = make_dataclass('Task', [
     namespace={'__post_init__': lambda self: None},
 )
 
-class Task(_TaskBase):
+class Task(_TaskBase, FilterMixin):
+    """
+    task[filter,...] should construct a Filter object that can be replied on to
+    only pass all events emitted from this very task.
+    """
     # XXX: counters, recent events
     counterdict = defaultdict(it.count)
     def __post_init__(self):
@@ -424,7 +680,7 @@ class Task(_TaskBase):
         # each task can have fixed number of receptors to subscribe events
         self.logger = logger.getChild(
             self.__class__.__name__).getChild(self.name)
-        self.receptors = {'exit': FutureReceptor(logger=self.logger)}
+        self.receptors = {'exit': FutureReceptor()}
         self.logger.addHandler(LastLogs(self.warnings))
         self._task = None
         self.milestones.add('created')
@@ -487,7 +743,8 @@ class Task(_TaskBase):
         raise NotImplementedError
 
     def send_event(self, hq, event):
-        return hq.send_event(event)
+        return hq.send_event(
+            {'task_name': self.name, 'context': self.context} | event)
 
     def new_artifact(self, hq, name=None, keep=True):
         return hq.new_artifact(name or self.name, keep, context=self)
@@ -510,6 +767,10 @@ class Task(_TaskBase):
         result['running'] = self.running
         result['exiting'] = self.exiting
         return result
+
+    def getfilter(self):
+        return Filter(
+            condition=lambda event: event.get('task_name') == self.name)
 
 
 class HQ:
@@ -624,11 +885,13 @@ class HQ:
         self.tasks.append(task)
         if self.running:
             task.start(self)
+        return task
 
     def add_rule(self, rule):
         if isinstance(rule, OptionalLoggerMixin):
             rule.logger = self.logger
         self.rules.append(rule)
+        return rule
 
     def send_event(self, event:dict):
         """tasks should call this to transmit new events"""
@@ -647,10 +910,11 @@ class HQ:
         return artifact
 
     def gen_artifact_name(self, name):
-        now = datetime.datetime.utcnow().strftime('%Y%m%d%H%M')
+        now = datetime.datetime.now(datetime.timezone.utc)
+        timestamp = now.strftime('%Y%m%d%H%M')
         cnt = next(self.artifact_counter)
         node_name = self.name
-        return f'{now}-{node_name}-{name}-{cnt}'
+        return f'{timestamp}-{node_name}-{name}-{cnt}'
 
     def forget_artifact(self, artifact):
         self.artifacts.remove(artifact)
@@ -693,7 +957,9 @@ class ShellTask(Task):
     result_file:str = 'sh.result'
     terminate_timeout:float = 5
     kill_timeout:float = 1
-    popen_kw:dict[str, Any] = field(default_factory=dict)
+    # popen options
+    env:dict[str,str] = None
+    # popen_kw:dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -736,7 +1002,7 @@ class ShellTask(Task):
             p = await asyncio.subprocess.create_subprocess_exec(
                 *args, cwd=str(artifact.path),
                 stdout=stdout, stderr=stderr,
-                **self.popen_kw,
+                env=self.env,
             )
             notify_tasks = []
             if self.stdout_mode == 'notify':
@@ -784,7 +1050,6 @@ class ShellTask(Task):
                         'kind': 'shell',
                         'topic': 'complete',
                         'status': result,
-                        'task_name': self.name,
                     })
 
     async def notify_output(self, hq, stream, pattern, name):
@@ -809,25 +1074,9 @@ class ShellTask(Task):
                 'topic': 'line',
                 'output': name,
                 'line': data,
-                'task_name': self.name,
             }
             event.update(extra)
             self.send_event(hq, event)
-
-    async def cancel_process(self, p):
-        p.terminate()
-        try:
-            await asyncio.wait_for(p.wait(), timeout=self.terminate_timeout)
-            return
-        except asyncio.TimeoutError:
-            self.logger.warning('terminating process timed out')
-
-        p.kill()
-        try:
-            await asyncio.wait_for(p.wait(), timeout=self.kill_timeout)
-            return
-        except asyncio.TimeoutError:
-            self.logger.error('killing process timed out, giving up')
 
 
 class REPLHelp(BaseException):
@@ -1174,8 +1423,8 @@ class ArtifactManager(Task):
     # def __post_init__
     def __init__(self, archiver, uploader, name='artifact-manager',):
         super().__init__(name=name)
-        self.receptors['artifact'] = QueueReceptor()
-        self.receptors['artifact'].add_rule(SimpleRule(self.filter_event))
+        self.receptors['artifact'] = QueueReceptor([Filter(self.filter_event)])
+        # self.receptors['artifact'].add_rule(SimpleRule(self.filter_event))
         self.uploader = uploader
         self.archiver = archiver
         self.executor = ThreadPoolExecutor()
@@ -1407,6 +1656,9 @@ class CRICtlData:
 
         raise ValueError(f'invalid comparison {self!r} with {other!r}')
 
+    def asdict(self):
+        return {'id': self.id}
+
 
 class CRIPodSandbox(CRICtlData):
     OBJTYPE = 'pod'
@@ -1570,7 +1822,6 @@ class CRIDiscovery(PeriodicTask):
                 'kind': 'discovery',
                 'topic': 'lost',
                 'objtype': self.datacls.OBJTYPE,
-                'task': self.name,
                 'object': obj,
             })
         for obj in added:
@@ -1580,7 +1831,6 @@ class CRIDiscovery(PeriodicTask):
                 'kind': 'discovery',
                 'topic': 'new',
                 'objtype': self.datacls.OBJTYPE,
-                'task': self.name,
                 'object': obj,
             })
 
@@ -1601,13 +1851,14 @@ class ImageDiscovery(CRIDiscovery):
 
 class PodContainerDiscovery(PeriodicTask):
     """a pod -> container combo"""
-    def __init__(self, pod_query, container_query,
+    def __init__(self, pod_query=None, container_query=None,
                  name=None, cadence=30,
                  inspect_pod=False, inspect_container=False):
         super().__init__(name=name, cadence=cadence)
-        self._pod_discovery = PodDiscovery(inspect=inspect_pod, query=pod_query)
+        self._pod_discovery = PodDiscovery(
+            name=self.name, inspect=inspect_pod, query=pod_query)
         self._container_discovery = ContainerDiscovery(
-            inspect=inspect_container, query=container_query)
+            name=self.name, inspect=inspect_container, query=container_query)
 
     async def run_once(self, hq):
         await self._pod_discovery.run_once(hq)
@@ -1626,11 +1877,12 @@ def _validate_period(v:Union[float,datetime.timedelta]):
         v = v.total_seconds()
     if not isinstance(v, (int, float)):
         raise ValueError(f'invalid time period {v!r}')
-    if v <= 0:
-        raise ValueError(f'time period must be positive, got {v}')
+    if v < 0:
+        raise ValueError(f'got negative period {v}')
     return v
 
-class DelayRule(SimpleRule):
+
+class DelayRule(Rule, FilterMixin):
     """ Generates a new event if a given event triggers.
     Duplcated triggering events are aggregated to a single event.
     Structure of the fired event will be:
@@ -1643,18 +1895,22 @@ class DelayRule(SimpleRule):
         "count": 1,
     }
     An optional throttle period can be provided, to block events after a flush.
+    DelayRule[filter] is a simple starter for building conditions by filtering
+    for the delayrule's identity. It uses the rule's name parameter as the
+    initial filter.
     """
-    def __init__(self, hq:HQ, name:str, delay:Union[float,datetime.timedelta],
-                 *args, throttle:Union[float,datetime.timedelta]=None,
-                 action=None, **kwargs):
-        if action:
-            raise ValueError('action is specialized in DelayRule')
-        super().__init__(*args, **kwargs)
+    def __init__(self, filter:FilterBase, hq:HQ, name:str,
+                 delay:Union[float,datetime.timedelta]=0,
+                 throttle:Union[float,datetime.timedelta]=0):
+        self.filter = build_filter(filter)
         self.hq = hq
         self.name = name
         self.delay = _validate_period(delay)
+        self.throttle = 0
         if throttle:
             self.throttle = _validate_period(throttle)
+        if not self.delay and not self.throttle:
+            raise ValueError('both delay and throttle are zero')
         self.throttle_until = None
         self.throttle_count = 0
         self.current_event = None
@@ -1665,13 +1921,13 @@ class DelayRule(SimpleRule):
             self.hq.send_event(self.current_event)
             self.current_event = None
 
-    def action(self, event):
+    def action(self, mutated, event):
         now = datetime.datetime.now(datetime.timezone.utc)
         if not self.current_event:
             if self.throttle_until and now < self.throttle_until:
                 self.throttle_count += 1
                 return
-            self.logger.debug('new event triggered delay')
+            logger.debug('new event triggered delay')
             self.current_event = {
                 'kind': 'delay',
                 'name': self.name,
@@ -1680,9 +1936,10 @@ class DelayRule(SimpleRule):
                 'last_seen': now,
                 'count': 1,
             }
-            asyncio.get_running_loop().call_later(
-                self.delay,
-                self.flush)
+            if self.delay:
+                asyncio.get_running_loop().call_later(self.delay, self.flush)
+            else:
+                self.flush()
             if self.throttle:
                 self.throttle_until = now + datetime.timedelta(
                     seconds=self.delay + self.throttle)
@@ -1693,40 +1950,71 @@ class DelayRule(SimpleRule):
         current_event['count'] += 1
         current_event['last_seen'] = now
 
+    def getfilter(self):
+        return Filter(lambda event: event.get('kind') == 'delay'
+                      and event.get('name') == self.name)
 
-class FissionRule(SimpleRule):
+
+class FissionRule(Rule, FilterMixin):
     """
-    templating method for creating & adding new tasks
+    templating method for creating & adding new tasks.
+    task_factory has a few requirements:
+    * should return exactly 1 task object
+    * name must be a keyword parameter, must be passed to Task
+    * context must be a keyword parameter, must be a dict if provided, must be
+      passed to Task
+    FissionRule uses the mutated outcome of the filter as keyword parameters
+    of the task_factory, user is responsible for making necessary mutations
+    so only needed keywords are passed on.
     """
-    def __init__(self, hq, task_factory,
-                 *args, name=None, action=None, **kwargs):
-        if action:
-            raise ValueError('action is specialized in FissionRule')
-        super().__init__(*args, **kwargs)
+    def __init__(self, filter, hq, task_factory, name=None):
         self.hq = hq
+        if name:
+            if not validate_name(name):
+                raise ValueError(f'invalid FissionRule name {name!r}')
+        else:
+            name = sanitize_name(repr(self))
         self.name = name
         self.task_factory = task_factory
         self.counter = it.count(1)
-        self.logger = logger.getChild(self.__class__.__name__)
+        self.filter = build_filter(filter)
 
     def next_task_name(self):
         return '-'.join(self.name + next(self.counter))
 
-    def action(self, event):
-        if not isinstance(event, dict):
-            raise ValueError('mutator of FissionRule must be a dict')
+    def action(self, mutated, event):
+        if not isinstance(mutated, dict):
+            raise ValueError('mutated event of FissionRule must be a dict')
 
-        params = event.copy()
+        params = mutated.copy()
         if self.name:
             params.setdefault('name',
                               '-'.join([self.name, str(next(self.counter))]))
 
-        new_task = self.task_factory(**params)
+        context = params.pop('context', {}) | {
+            'task_created_by': 'FissionRule',
+            'rule_name': self.name,
+            'event': event,
+        }
+        new_task = self.task_factory(context=context, **params)
         if not isinstance(new_task, Task):
             raise ValueError(f'factory {self.task_factory!r} '
                              f'generated non-task {new_task!r}')
 
         self.hq.add_task(new_task)
+
+    def getfilter(self):
+        def f(event):
+            if not event.get('context'):
+                return False
+            context = event['context']
+            if not isinstance(context, dict):
+                return False
+            if context.get('task_created_by') != 'FissionRule':
+                return False
+            return context['rule_name'] == self.name
+
+        return Filter(f)
 
 
 def main(hq):

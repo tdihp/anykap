@@ -45,8 +45,8 @@ async def test_shelltask_notify(hq, hqtask):
     await asyncio.wait_for(outnotify.join(), timeout=1)
     assert q.empty()  # we should only have one of such event for now
     errnotify = ShellTask(
-        'errnotify',
-        r'''
+        name='errnotify',
+        script=r'''
         echo "someerror" >&2
         echo "should ignore"
         exit 10''',
@@ -62,8 +62,8 @@ async def test_shelltask_notify(hq, hqtask):
     assert q.empty
 
     regexnotify = ShellTask(
-        'regexnotify',
-        r'''
+        name='regexnotify',
+        script=r'''
         seq 100 | xargs -I{} bash -c 'echo "log info {}"'
         sleep 1
         ''',
@@ -91,8 +91,8 @@ async def test_shelltask_timeout(hq, hqtask):
 
     hq.add_rule(myrule)
     sleepforever = ShellTask(
-        'sleep-forever',
-        r'''
+        name='sleep-forever',
+        script=r'''
         sleep infinity
         ''',
         timeout=1
@@ -105,8 +105,8 @@ async def test_shelltask_timeout(hq, hqtask):
     assert q.empty()
 
     sleepblocksigterm = ShellTask(
-        'sleep-block-sigterm',
-        r'''
+        name='sleep-block-sigterm',
+        script=r'''
         trap "" SIGTERM
         sleep infinity
         ''',

@@ -76,8 +76,9 @@ async def test_cridiscovery(hq, hqtask):
         return {'kind': 'discovery',
                 'topic': topic,
                 'objtype': 'dummy',
-                'task': 'cridiscovery-0',
-                'object': CRIDummy({'id': id})}
+                'task_name': 'cridiscovery-0',
+                'object': CRIDummy({'id': id}),
+                'context': None}
     assert results == [
         r('item1', 'new'),
         r('item2', 'new'),
