@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: something-contoso
+  labels:
+    application: contoso
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command:
+    - sh
+    - -c
+    - |
+      echo 'hello world'
+      sleep 60
+      while true; do
+        seq 100 | xargs -I{} echo 'a very curous error: {}!'
+        sleep 300
+      done
