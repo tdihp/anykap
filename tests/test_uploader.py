@@ -30,10 +30,10 @@ def shared_key():
 
 
 @pytest.fixture(scope='session')
-@pytest.mark.skipif(not shutil.which('openssl'),
-                    reason='openssl is required for certpair')
 def blob_server_cert(storage_account, tmp_path_factory):
     """returns cert and key paths"""
+    if not shutil.which('openssl'):
+        pytest.skip('openssl not available')
     server_name = f'{storage_account}.blob.core.windows.net'
     path = tmp_path_factory.mktemp('openssl')
     # path = tmp_path / openssl
@@ -52,12 +52,12 @@ def blob_server_cert(storage_account, tmp_path_factory):
 
 
 @pytest.fixture
-@pytest.mark.skipif(not shutil.which('azurite'),
-                    reason='azureite is required')
 @pytest.mark.skipif(not has_azure_storage_blob,
                     reason='azure.storage.blob is required')
 def azurite(tmp_path, blob_server_cert, unused_tcp_port_factory,
             storage_account, shared_key):
+    if not shutil.which('azurite'):
+        pytest.skip('azureite not installed')
     blob_port = unused_tcp_port_factory()
     queue_port = unused_tcp_port_factory()
     table_port = unused_tcp_port_factory()
@@ -76,7 +76,6 @@ def azurite(tmp_path, blob_server_cert, unused_tcp_port_factory,
 
     p = subprocess.Popen(azurite_args)
     yield server_name, '127.0.0.1', cert, blob_port, queue_port, table_port
-
 
     p.terminate()
     p.wait(timeout=10)  # it takes quite long for azurite to terminate
