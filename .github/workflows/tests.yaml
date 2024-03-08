@@ -14,4 +14,5 @@ jobs:
             3.10
             3.9
       - run: pip install hatch
+      - run: ls -la
       - run: hatch test:pytest
