@@ -19,19 +19,22 @@ Create a virtual environment
 Install dependencies
 
     python -m pip install -U pip
-    pip install pytest pytest-cov pytest-asyncio 
+    pip install -r requirements.txt
 
 Install anykap for local development
 
     pip install -e .
 
+Anykap configures [pre-commit](https://pre-commit.com/) for linting and code
+style via black. To install git pre-commit hooks:
+
+    pre-commit install --install-hooks
+
 For testing Azure blob, 
-[install azurite](https://github.com/Azure/Azurite?tab=readme-ov-file#npm) and
-azure-storage-blob
+[install azurite](https://github.com/Azure/Azurite?tab=readme-ov-file#npm)
 
     npm install -g azurite
-    pip install azure-storage-blob
 
 For running tests:
 
-    pytest --cov src/anykap
+    hatch run pytest --cov src/anykap

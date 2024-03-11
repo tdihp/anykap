@@ -14,7 +14,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 minversion = "7"
-addopts = "-ra --ignore=tests/sync"
+addopts = "-ra"
 asyncio_mode = "auto"
 testpaths = [
     "tests",
@@ -28,7 +28,7 @@ kubectl-anykap = "anykap.client:main"
 [tool.hatch.version]
 path = "src/anykap/__init__.py"
 
-[tool.hatch.envs.test]
+[tool.hatch.envs.default]
 dependencies = [
   "pytest",
   "pytest-asyncio",
@@ -39,6 +39,17 @@ dependencies = [
 
 [[tool.hatch.envs.test.matrix]]
 python = ["3.9", "3.10", "3.11", "3.12"]
+
+[tool.hatch.envs.lint]
+template = "lint"
+detached = true
+dependencies = [
+  "black",
+]
+
+[tool.hatch.envs.lint.scripts]
+lint = ["black --check --diff {args:.}"]
+format = ["black {args:.}"]
 
 [build-system]
 requires = ["hatchling"]
