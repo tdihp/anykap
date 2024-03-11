@@ -5,7 +5,7 @@ import tarfile
 import pytest
 from hashlib import md5
 from pathlib import Path
-from anykap import *
+from anykap import archive_zip, archive_tar
 
 
 def md5hash(x):

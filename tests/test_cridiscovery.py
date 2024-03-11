@@ -1,7 +1,8 @@
 import pytest
 import time
+import asyncio
 from unittest.mock import AsyncMock, call
-from anykap import *
+from anykap import PeriodicTask, CRICtlData, CRIDiscovery
 
 
 async def test_periodic_task(hq, hqtask):

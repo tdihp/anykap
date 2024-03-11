@@ -36,7 +36,7 @@ def hqthread(hq, event_loop):
     def target():
         try:
             event_loop.run_until_complete(hq.run())
-        except:
+        except BaseException:
             nonlocal exception_raised
             exception_raised = True
             traceback.print_exc()

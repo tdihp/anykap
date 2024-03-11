@@ -1,5 +1,5 @@
 import asyncio
-from anykap import *
+from anykap import Task
 
 
 # failed task run shouldn't fail hq, visually inspect if a message is logged

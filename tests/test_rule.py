@@ -3,7 +3,9 @@
 # import zipfile
 import pytest
 from unittest.mock import Mock
-from anykap import *
+import asyncio
+import datetime
+from anykap import Task, FissionRule, Filter, DelayRule, FutureReceptor
 
 
 def _w(v):
@@ -98,8 +100,7 @@ async def test_delay(hq, hqtask):
     )
     hq.add_rule(outputrule)
     hq.add_rule(rule)
-    eventtask = asyncio.create_task(eventgen())
-    await asyncio.wait_for(done, timeout=5)
+    await asyncio.wait_for(eventgen(), timeout=5)
     await asyncio.sleep(0.3)
     assert len(results) == 2
     for result in results:
@@ -128,4 +129,4 @@ async def test_future_receptor():
     await asyncio.sleep(0)  # allow get to be ran
     receptor({"foo3": "bar"})
     with pytest.raises(asyncio.TimeoutError):
-        result = await asyncio.wait_for(wait_task, timeout=0.1)
+        await asyncio.wait_for(wait_task, timeout=0.1)

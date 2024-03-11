@@ -1,5 +1,7 @@
-from anykap import *
 import signal
+import asyncio
+from asyncio import Queue
+from anykap import ShellTask
 
 
 async def test_shelltask_simple(hq, hqtask):
@@ -25,7 +27,7 @@ async def test_shelltask_simple(hq, hqtask):
 
 
 async def test_shelltask_notify(hq, hqtask):
-    q = queue.Queue()
+    q = Queue()
 
     def myrule(event):
         if event.get("kind") == "shell" and event.get("topic") == "line":
@@ -90,7 +92,7 @@ async def test_shelltask_notify(hq, hqtask):
 
 
 async def test_shelltask_timeout(hq, hqtask):
-    q = queue.Queue()
+    q = Queue()
 
     def myrule(event):
         if event.get("kind") == "shell" and event.get("topic") == "complete":

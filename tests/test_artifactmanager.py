@@ -1,7 +1,8 @@
 import sys
 from inspect import getsource
 import zipfile
-from anykap import *
+import asyncio
+from anykap import Task, ArtifactManager, archive_zip, CopyUploader
 
 
 # @pytest.mark.skip

@@ -4,8 +4,10 @@ import subprocess
 import sys
 from inspect import getsource
 import ssl
-from anykap import *
-from anykap.azure import *
+import datetime
+import urllib
+from anykap import CopyUploader
+from anykap.azure import AzureBlobUploader, azureblob_make_url
 
 try:
     from azure.storage.blob import BlobServiceClient, generate_container_sas

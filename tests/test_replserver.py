@@ -1,8 +1,11 @@
-from anykap import *
+import time
+import shlex
 import socket
 import pytest
 import contextlib
+import json
 from queue import SimpleQueue
+from anykap import REPLServer, HQREPLServer
 
 
 @pytest.fixture
@@ -77,7 +80,6 @@ class REPLClient(object):
     def recv(self):
         sk = self.sk
         buffer = bytearray()
-        limit = 100000
         while not buffer.endswith(b"\r\n\r\n"):
             # print(f"buffer: {buffer}")
             data = sk.recv(1024)
@@ -138,8 +140,6 @@ def test_tasks(hq, hqthread, hqreplserver):
         # we no longer test exact content for the text output
         result = replclient.query("-o", "json", "t", "-a")
         assert result[0] == "OK"
-        d = json.loads(result[1])["items"][0]
-        # assert d['']
 
 
 def test_send(hq, hqthread, hqreplserver):

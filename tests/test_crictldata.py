@@ -1,6 +1,6 @@
 from unittest.mock import patch
 import pytest
-from anykap import *
+from anykap import CRIPodSandbox, CRIContainer, CRIImage
 
 CRICTL_PODS_OUTCOME = rb"""
 {

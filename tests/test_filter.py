@@ -1,4 +1,4 @@
-from anykap import *
+from anykap import SugarStub, build_filter
 import pytest
 
 
