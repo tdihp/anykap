@@ -26,7 +26,8 @@ Install anykap for local development
     pip install -e .
 
 Anykap configures [pre-commit](https://pre-commit.com/) for linting and code
-style via black. To install git pre-commit hooks:
+style via [black](https://github.com/psf/black) and
+[ruff](https://github.com/astral-sh/ruff). To install git pre-commit hooks:
 
     pre-commit install --install-hooks
 
