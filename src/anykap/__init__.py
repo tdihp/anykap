@@ -1,6 +1,7 @@
 from collections.abc import Callable
-from typing import Optional, Any, Type, Union, Literal, NewType
-from dataclasses import dataclass, field, make_dataclass, asdict
+from typing import Optional, Any, Type, Union, Literal, NewType, Iterable
+from dataclasses import dataclass, field, asdict
+from functools import partial
 from collections import defaultdict, UserDict, deque
 import os
 from pathlib import Path
@@ -136,26 +137,6 @@ def json_default(o):
     elif isinstance(o, CRICtlData):
         return o.asdict()
     raise TypeError(f"unable to convert {o!r} to json")
-
-
-class OptionalLoggerMixin:
-    """Optional logger property that defaults to the root logger"""
-
-    @property
-    def logger(self):
-        if hasattr(self, "_logger") and self._logger:
-            return self._logger
-        global logger
-        return logger
-
-    @logger.setter
-    def logger(self, v):
-        if v:
-            self._logger = v
-            self.set_logger(v)
-
-    def set_logger(self, v):
-        pass
 
 
 # -------------
@@ -672,39 +653,24 @@ class Artifact:
 
 task_dataclass = dataclass(eq=False, unsafe_hash=False)
 
-_TaskBase = make_dataclass(
-    "Task",
-    [
-        ("name", Optional[str], None),
-        ("context", Any, None),
-        # ('receptors', dict[str, Receptor], field(init=False)),
-        # ('running', bool, field(init=False)),
-        # ('exiting', bool, field(init=False)),
-        # ('counter', dict[str, int], field(init=False, default_factory=Counter)),
-        ("milestones", Milestones, field(init=False, default_factory=Milestones)),
-        (
-            "warnings",
-            list[str],
-            field(init=False, default_factory=lambda: deque(maxlen=3)),
-        ),
-    ],
-    eq=False,
-    unsafe_hash=False,
-    namespace={"__post_init__": lambda self: None},
-)
 
-
-class Task(_TaskBase, FilterMixin):
+@task_dataclass
+class Task(FilterMixin):
     """
     task[filter,...] should construct a Filter object that can be replied on to
     only pass all events emitted from this very task.
     """
 
+    name: Optional[str] = None
+    context: Any = None
+    milestones: Milestones = field(init=False, default_factory=Milestones)
+    warnings: Iterable[str] = field(
+        init=False, default_factory=partial(deque, maxlen=3)
+    )
     # XXX: counters, recent events
     counterdict = defaultdict(it.count)
 
     def __post_init__(self):
-        super().__post_init__()
         if self.name is None:
             clsname = sanitize_name(self.__class__.__name__)
             id_ = next(self.counterdict[clsname])
@@ -926,8 +892,6 @@ class HQ:
         return task
 
     def add_rule(self, rule):
-        if isinstance(rule, OptionalLoggerMixin):
-            rule.logger = self.logger
         self.rules.append(rule)
         return rule
 
