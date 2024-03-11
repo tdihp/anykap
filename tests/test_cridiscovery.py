@@ -52,37 +52,59 @@ async def test_cridiscovery(hq, hqtask):
         run_crictl = mock
 
     mytask = CRIDiscovery(CRIDummy, cadence=0.1, query=dict(namespace='foobar'))
-    crictl_outputs = [
-        {'items': [{'id': 'item1',}]},
-        {'items': [{'id': 'item1',}]},
-        {'items': [{'id': 'item1',}, {'id': 'item2'}]},
-        {'items': [{'id': 'item2'}]},
-        {'items': [{'id': 'item3'}]},
-        # lambda: mytask.exit(),
+    test_ladder = [
+        (
+            {'items': [{'id': 'item1',}]},
+            [
+                {'topic': 'first_seen'},
+                {'topic': 'new', 'object': CRIDummy({'id': 'item1'})},
+            ],
+        ),
+        (
+            {'items': [{'id': 'item1'}, {'id': 'item2'}]},
+            [{'topic': 'new', 'object': CRIDummy({'id': 'item2'})}],
+        ),
+        (
+            {'items': [{'id': 'item2'}]},
+            [{'topic': 'lost', 'object': CRIDummy({'id': 'item1'})}],
+        ),
+        (
+            {'items': [{'id': 'item3'}]},
+            [
+                {'topic': 'lost', 'object': CRIDummy({'id': 'item2'})},
+                {'topic': 'new', 'object': CRIDummy({'id': 'item3'})},
+            ],
+        ),
+        (
+            {'items': []},
+            [
+                {'topic': 'last_gone'},
+                {'topic': 'lost', 'object': CRIDummy({'id': 'item3'})},
+            ],
+        ),
     ]
     done = asyncio.Future()
+    results = [[] for _ in test_ladder]
+    result_id = 0
+    def side_effect():
+        for items, result in test_ladder:
+            yield items
+            nonlocal result_id
+            result_id += 1
+        done.set_result(True)
+        while True:
+            yield {'items': []}
+
     def myrule(event):
         if event['kind'] == 'discovery':
-            results.append(event)
-            if len(results) == 5:
-                done.set_result(True)
+            nonlocal result_id
+            results[result_id].append(event)
 
-    mock.side_effect = crictl_outputs
+    mock.side_effect = side_effect()
     hq.add_rule(myrule)
     hq.add_task(mytask)
     await asyncio.wait_for(done, timeout=1)
-    assert mock.await_args_list == [call(['crictl', 'dummy', '-o', 'json', '--namespace', 'foobar'])] * 5
-    def r(id, topic):
-        return {'kind': 'discovery',
-                'topic': topic,
-                'objtype': 'dummy',
-                'task_name': 'cridiscovery-0',
-                'object': CRIDummy({'id': id}),
-                'context': None}
-    assert results == [
-        r('item1', 'new'),
-        r('item2', 'new'),
-        r('item1', 'lost'),
-        r('item2', 'lost'),
-        r('item3', 'new'),
-    ]
+    assert mock.await_args_list == [call(['crictl', 'dummy', '-o', 'json', '--namespace', 'foobar'])] * 6
+    event_base = {'objtype': 'dummy', 'task_name': 'cridiscovery-0', 'context': None, 'kind': 'discovery'}
+    for (item, expected), actual in zip(test_ladder, results):
+        assert [event_base | e for e in expected] == actual

@@ -2,7 +2,6 @@ from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal, NewType
 from dataclasses import dataclass, field, make_dataclass, asdict
 from collections import defaultdict, UserDict, Counter, deque
-from collections.abc import Sequence, Mapping
 import os
 from pathlib import Path
 import itertools as it
@@ -21,6 +20,8 @@ import json
 import tempfile
 import operator
 from concurrent.futures import ThreadPoolExecutor
+import zipfile
+import tarfile
 import logging
 
 # ------------------------------------------------------------------------------
@@ -1526,7 +1527,6 @@ def preserving_tempfile(*args, **kwargs):
 
 def archive_tar(datapath:str, outpath:str, basedir:str=None, compressor='gz',
                 **kwargs):
-    import tarfile
     suffix = '.tar'
     tarmode = 'w'
     if not compressor in (None, 'gz', 'bz2', 'xz'):
@@ -1547,7 +1547,7 @@ def archive_tar(datapath:str, outpath:str, basedir:str=None, compressor='gz',
 
 
 def archive_zip(datapath:str, outpath:str, basedir:str=None, **kwargs):
-    import zipfile
+    
     basedir = basedir or os.path.basename(datapath)
     stack = contextlib.ExitStack()
     with stack:
@@ -1809,14 +1809,29 @@ class CRIDiscovery(PeriodicTask):
         return set(self.watching)
 
     async def run_once(self, hq):
+        watching = self.watching
         result = set(await self.datacls.list(**self.query))
         if hasattr(self, 'filter'):
             # we optionally filter the list with some external filter
             # for filter crictl ps with a crictl pods outcome
             result = set(filter(self.filter, result))
 
-        added = result - self.watching
-        removed = self.watching - result
+        added = result - watching
+        removed = watching - result
+        new_watching = (watching | added) - removed
+        self.watching = new_watching
+        if new_watching and not watching:
+            self.send_event(hq, {
+                'kind': 'discovery',
+                'topic': 'first_seen',
+                'objtype': self.datacls.OBJTYPE,
+            })
+        elif watching and not new_watching:
+            self.send_event(hq, {
+                'kind': 'discovery',
+                'topic': 'last_gone',
+                'objtype': self.datacls.OBJTYPE,
+            })
         for obj in removed:
             self.send_event(hq, {
                 'kind': 'discovery',
@@ -1834,8 +1849,6 @@ class CRIDiscovery(PeriodicTask):
                 'object': obj,
             })
 
-        self.watching -= removed
-        self.watching |= added
 
 class PodDiscovery(CRIDiscovery):
     def __init__(self, **kwargs):
