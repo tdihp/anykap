@@ -67,7 +67,7 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout, logger=logger)
     try:
         yield p
     finally:
-        if p.returncode != None:
+        if p.returncode is not None:
             return
 
         logger.info(
@@ -82,7 +82,7 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout, logger=logger)
         except asyncio.TimeoutError:
             logger.warning("terminate timed out")
         else:
-            if p.returncode != None:
+            if p.returncode is not None:
                 logger.info("terminate complete")
             else:
                 logger.warning("terminate interrupted")
@@ -95,7 +95,7 @@ async def subprocess_teardown(p, terminate_timeout, kill_timeout, logger=logger)
         except asyncio.TimeoutError:
             logger.warning("kill timed out")
         else:
-            if p.returncode != None:
+            if p.returncode is not None:
                 logger.info("kill complete")
             else:
                 logger.warning("kill interrupted")
@@ -1571,7 +1571,7 @@ class ArtifactManager(Task):
         finally:
             try:
                 fpath.unlink()
-            except:
+            except Exception:
                 logger.exception("failed removing file %s", fpath)
         artifact.upload_complete(str(result))
 
@@ -1586,7 +1586,7 @@ class ArtifactManager(Task):
             try:
                 await self.process_artifact(artifact)
             # except asyncio.CancelledError: # XXX try finish upload?
-            except:
+            except Exception:
                 logger.exception("processing artifact failed")
 
     async def run_task(self, hq):
@@ -1625,7 +1625,7 @@ def preserving_tempfile(*args, **kwargs):
         logger.exception("got exception when writing archive, removing")
         try:
             os.remove(fpath)
-        except:
+        except Exception:
             logger.exception("failed removing %r", fpath)
         raise
 

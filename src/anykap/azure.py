@@ -79,7 +79,6 @@ def azureblob_make_url(
     set_config("sas", sas)
 
     if url:
-        use_ipaddr = False
         parsed = urllib.parse.urlparse(url)
         set_config("scheme", parsed.scheme)
         if parsed.netloc:

@@ -1,3 +1,9 @@
+# ruff: noqa
+import urllib
+
+AZUREBLOB_ACCOUNT_PATTERN = r"[a-z0-9]{3,24}"
+
+
 # I don't want to throw this away, it is rather better IMO than the official SDK
 # today
 def azureblob_sign_request(method, url, headers):
