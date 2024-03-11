@@ -7,17 +7,18 @@ from anykap import *
 # for exception not catched
 async def test_exception(hq, hqtask):
     called = asyncio.Future()
+
     class MyTask(Task):
         async def run_task(self, hq):
             # nonlocal called
             # called.set_result(True)
-            raise Exception('oops')
+            raise Exception("oops")
 
     task = MyTask()
     hq.add_task(task)
     task._task.add_done_callback(lambda task: called.set_result(True))
     await asyncio.wait_for(called, timeout=1)
-    assert len(task.warnings) == 1 and 'oops' in task.warnings[0]
+    assert len(task.warnings) == 1 and "oops" in task.warnings[0]
 
 
 async def test_task_exit(hq, hqtask):
@@ -26,8 +27,8 @@ async def test_task_exit(hq, hqtask):
             await asyncio.sleep(1000)
 
     task = MyTask()
-    task.receptors['exit'].add_filter(lambda event: event.get('foo') == 'bar')
+    task.receptors["exit"].add_filter(lambda event: event.get("foo") == "bar")
     hq.add_task(task)
     await asyncio.sleep(0)
-    hq.send_event({'foo': 'bar'})
+    hq.send_event({"foo": "bar"})
     await asyncio.wait_for(task.join(), timeout=1)

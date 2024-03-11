@@ -7,67 +7,95 @@ import pytest
 
 envimporter_src = inspect.getsource(envimporter)
 
+
 def test_envimporter_direct():
-    samplemodule = dedent("""\
+    samplemodule = dedent(
+        """\
         print("hello world")
         important_value=42
-        """)
-    script = dedent("""\
+        """
+    )
+    script = dedent(
+        """\
         install_envimporter()
         from foobar import important_value
         assert important_value == 42
-        """)
-    full_script = '\n'.join([envimporter_src, script])
-    result = run([sys.executable, '-c', full_script],
-                 env={'PYMODULE__FOOBAR': samplemodule},
-                 stdout=PIPE, text=True)
-    assert result.stdout.strip() == 'hello world'
+        """
+    )
+    full_script = "\n".join([envimporter_src, script])
+    result = run(
+        [sys.executable, "-c", full_script],
+        env={"PYMODULE__FOOBAR": samplemodule},
+        stdout=PIPE,
+        text=True,
+    )
+    assert result.stdout.strip() == "hello world"
     assert result.returncode == 0
     # assert False
 
 
 def test_envimporter_prefix():
-    samplemodule = dedent("""\
+    samplemodule = dedent(
+        """\
         print("hello world")
         important_value=42
-        """)
-    script = dedent("""\
+        """
+    )
+    script = dedent(
+        """\
         install_envimporter(valid_prefix="foobar")
         from foobar import important_value
         assert important_value == 42
-        """)
-    full_script = '\n'.join([envimporter_src, script])
-    result = run([sys.executable, '-c', full_script],
-                 env={'PYMODULE__FOOBAR': samplemodule},
-                 stdout=PIPE, text=True)
+        """
+    )
+    full_script = "\n".join([envimporter_src, script])
+    result = run(
+        [sys.executable, "-c", full_script],
+        env={"PYMODULE__FOOBAR": samplemodule},
+        stdout=PIPE,
+        text=True,
+    )
     assert result.returncode == 0
-    script = dedent("""\
+    script = dedent(
+        """\
         install_envimporter(valid_prefix="nope")
         from foobar import important_value
         assert important_value == 42
-        """)
-    full_script = '\n'.join([envimporter_src, script])
-    result = run([sys.executable, '-c', full_script],
-                 env={'PYMODULE__FOOBAR': samplemodule},
-                 stdout=PIPE, stderr=PIPE, text=True)
+        """
+    )
+    full_script = "\n".join([envimporter_src, script])
+    result = run(
+        [sys.executable, "-c", full_script],
+        env={"PYMODULE__FOOBAR": samplemodule},
+        stdout=PIPE,
+        stderr=PIPE,
+        text=True,
+    )
     assert result.returncode == 1
-    assert 'ModuleNotFoundError' in result.stderr
+    assert "ModuleNotFoundError" in result.stderr
 
 
 def test_submodule():
-    samplemodule = dedent("""\
+    samplemodule = dedent(
+        """\
         print("hello world")
         important_value=42
-        """)
-    script = dedent("""\
+        """
+    )
+    script = dedent(
+        """\
         install_envimporter(valid_prefix="foo")
         from foo.bar import important_value
         assert important_value == 42
-        """)
-    full_script = '\n'.join([envimporter_src, script])
-    result = run([sys.executable, '-c', full_script],
-                 env={'PYMODULE__FOO__BAR': samplemodule, 'PYMODULE__FOO': ''},
-                 stdout=PIPE, stderr=PIPE, text=True
-                 )
-    assert result.stdout.strip() == 'hello world'
+        """
+    )
+    full_script = "\n".join([envimporter_src, script])
+    result = run(
+        [sys.executable, "-c", full_script],
+        env={"PYMODULE__FOO__BAR": samplemodule, "PYMODULE__FOO": ""},
+        stdout=PIPE,
+        stderr=PIPE,
+        text=True,
+    )
+    assert result.stdout.strip() == "hello world"
     assert result.returncode == 0

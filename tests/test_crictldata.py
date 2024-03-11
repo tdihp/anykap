@@ -1,9 +1,8 @@
-
 from unittest.mock import Mock, patch, AsyncMock
 import pytest
 from anykap import *
 
-CRICTL_PODS_OUTCOME = rb'''
+CRICTL_PODS_OUTCOME = rb"""
 {
   "items": [
     {
@@ -54,9 +53,9 @@ CRICTL_PODS_OUTCOME = rb'''
     }
   ]
 }
-'''
+"""
 
-CRICTL_PS_OUTCOME = rb'''
+CRICTL_PS_OUTCOME = rb"""
 {
   "containers": [
     {
@@ -121,9 +120,9 @@ CRICTL_PS_OUTCOME = rb'''
     }
   ]
 }
-'''
+"""
 
-CRICTL_IMG_OUTCOME = rb'''
+CRICTL_IMG_OUTCOME = rb"""
 {
   "images": [
     {
@@ -156,9 +155,9 @@ CRICTL_IMG_OUTCOME = rb'''
     }
   ]
 }
-'''
+"""
 
-CRICTL_INSPECTP_OUTCOME = rb'''
+CRICTL_INSPECTP_OUTCOME = rb"""
 {
   "status": {
     "id": "3eff2d8d3a4f3d3c0d1c4d4737c21b397bf7cbf77fd8a0fe370f6a59129cd535",
@@ -1011,9 +1010,9 @@ CRICTL_INSPECTP_OUTCOME = rb'''
     }
   }
 }
-'''
+"""
 
-CRICTL_INSPECT_OUTCOME = rb'''
+CRICTL_INSPECT_OUTCOME = rb"""
 {
   "status": {
     "id": "f3a240d625b1e97b859e29f81360fd79538021c46eaafb325dc0fa195c8e4b6a",
@@ -1599,9 +1598,9 @@ CRICTL_INSPECT_OUTCOME = rb'''
     }
   }
 }
-'''
+"""
 
-CRICTL_INSPECTI_OUTCOME = rb'''
+CRICTL_INSPECTI_OUTCOME = rb"""
 {
   "status": {
     "id": "sha256:b0b1fa0f58c6e932b7f20bf208b2841317a1e8c88cc51b18358310bbd8ec95da",
@@ -1671,32 +1670,42 @@ CRICTL_INSPECTI_OUTCOME = rb'''
     }
   }
 }
-'''
+"""
 
 
 @pytest.mark.parametrize(
-        "cls,outcome,inspect_outcome,id,inspect_f,inspect_result", [
-            (CRIPodSandbox, CRICTL_PODS_OUTCOME, CRICTL_INSPECTP_OUTCOME,
-             '3eff2d8d3a4f3d3c0d1c4d4737c21b397bf7cbf77fd8a0fe370f6a59129cd535',
-             lambda d: d.info['runtimeSpec']['linux']['cgroupsPath'],
-             'kubelet-kubepods-burstable-pod44e4b37f_504f_4f1c_80f3_4137bfbec5e4.slice:cri-containerd:3eff2d8d3a4f3d3c0d1c4d4737c21b397bf7cbf77fd8a0fe370f6a59129cd535'
-            ),
-            (CRIContainer, CRICTL_PS_OUTCOME, CRICTL_INSPECT_OUTCOME,
-             'f3a240d625b1e97b859e29f81360fd79538021c46eaafb325dc0fa195c8e4b6a',
-             lambda d: d.info['pid'],
-             1478
-            ),
-            (CRIImage, CRICTL_IMG_OUTCOME, CRICTL_INSPECTI_OUTCOME,
-             'sha256:b0b1fa0f58c6e932b7f20bf208b2841317a1e8c88cc51b18358310bbd8ec95da',
-             lambda d: d.info['imageSpec']['config']['Cmd'],
-             ['/bin/kindnetd']
-            )
-        ])
-async def test_crictldata(
-    cls, outcome, inspect_outcome, id, inspect_f, inspect_result):
-    with patch('asyncio.subprocess.create_subprocess_exec') as fp:
+    "cls,outcome,inspect_outcome,id,inspect_f,inspect_result",
+    [
+        (
+            CRIPodSandbox,
+            CRICTL_PODS_OUTCOME,
+            CRICTL_INSPECTP_OUTCOME,
+            "3eff2d8d3a4f3d3c0d1c4d4737c21b397bf7cbf77fd8a0fe370f6a59129cd535",
+            lambda d: d.info["runtimeSpec"]["linux"]["cgroupsPath"],
+            "kubelet-kubepods-burstable-pod44e4b37f_504f_4f1c_80f3_4137bfbec5e4.slice:cri-containerd:3eff2d8d3a4f3d3c0d1c4d4737c21b397bf7cbf77fd8a0fe370f6a59129cd535",
+        ),
+        (
+            CRIContainer,
+            CRICTL_PS_OUTCOME,
+            CRICTL_INSPECT_OUTCOME,
+            "f3a240d625b1e97b859e29f81360fd79538021c46eaafb325dc0fa195c8e4b6a",
+            lambda d: d.info["pid"],
+            1478,
+        ),
+        (
+            CRIImage,
+            CRICTL_IMG_OUTCOME,
+            CRICTL_INSPECTI_OUTCOME,
+            "sha256:b0b1fa0f58c6e932b7f20bf208b2841317a1e8c88cc51b18358310bbd8ec95da",
+            lambda d: d.info["imageSpec"]["config"]["Cmd"],
+            ["/bin/kindnetd"],
+        ),
+    ],
+)
+async def test_crictldata(cls, outcome, inspect_outcome, id, inspect_f, inspect_result):
+    with patch("asyncio.subprocess.create_subprocess_exec") as fp:
         p = fp.return_value
-        p.communicate.return_value = outcome, b''
+        p.communicate.return_value = outcome, b""
         p.returncode = 0
         result = await cls.list()
         assert len(result) == 2
@@ -1705,6 +1714,6 @@ async def test_crictldata(
         with pytest.raises(Exception):
             inspect_f(result[0])
 
-        p.communicate.return_value = inspect_outcome, b''
+        p.communicate.return_value = inspect_outcome, b""
         await result[0].inspect_once()
         assert inspect_f(result[0]) == inspect_result

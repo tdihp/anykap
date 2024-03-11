@@ -15,7 +15,7 @@ def logconf(caplog):
 # use async fixture since 3.9 asyncio.queues.Queue requires current loop
 @pytest_asyncio.fixture
 async def hq(tmp_path):
-    return HQ(datapath=tmp_path / 'hq')
+    return HQ(datapath=tmp_path / "hq")
 
 
 @pytest_asyncio.fixture
@@ -30,7 +30,9 @@ async def hqtask(hq):
 def hqthread(hq, event_loop):
     """this one is for sync tests"""
     import traceback
+
     exception_raised = False
+
     def target():
         try:
             event_loop.run_until_complete(hq.run())
