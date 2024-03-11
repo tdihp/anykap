@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: format
+        name: format
+        language: system
+        entry: hatch run lint:format
+        language: python
+        types: [python]
+        pass_filenames: false
+        verbose: true
+      - id: linter
+        name: linter
+        language: system
+        entry: hatch run lint:lint
+        language: python
+        types: [python]
+        pass_filenames: false
