@@ -1,10 +1,6 @@
 import shutil
 import pytest
 import subprocess
-import socket
-import random
-import signal
-from unittest.mock import Mock, patch
 import sys
 from inspect import getsource
 import ssl

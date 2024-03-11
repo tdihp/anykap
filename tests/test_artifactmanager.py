@@ -1,7 +1,6 @@
 import sys
 from inspect import getsource
 import zipfile
-import pytest
 from anykap import *
 
 

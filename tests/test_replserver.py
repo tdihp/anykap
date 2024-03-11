@@ -2,7 +2,6 @@ from anykap import *
 import socket
 import pytest
 import contextlib
-import struct
 from queue import SimpleQueue
 
 

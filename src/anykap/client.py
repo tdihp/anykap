@@ -36,7 +36,7 @@ MANIFEST = {
     #(local name,               workspace,              fmt,    in_cm,  comment),
     ("kustomization.yaml.fmt",  "kustomization.yaml",   True,   False,  False),
     ("daemonset.yaml.fmt",      "daemonset.yaml",       True,   False,  False),
-    ("capture.py.fmt",          "capture.py",           True,   True,   False),
+    ("capture.py",              "capture.py",           False,  True,   False),
     ("__init__.py",             _env("anykap"),         False,  True,   False),
     ("azure.py",                _env("anykap.azure"),   False,  True,   True),
     ("envimporter.py",          "envimporter.py",       False,  True,   False),
@@ -54,7 +54,7 @@ def find_kustomization_file(parser, args):
         if fpath.is_file():
             return fpath
 
-    parser.exit(f"kustomization file no found")
+    parser.exit("kustomization file no found")
 
 
 def kubectl(*args):
@@ -152,7 +152,7 @@ def get_metadata(parser, args):
         if not NAME_PARSER.fullmatch(name):
             parser.exit(f"invalid name {name!r} " "specified in metadata.annotations")
     except KeyError:
-        parser.exit(f"unable to find annotation anykap/name in metadata")
+        parser.exit("unable to find annotation anykap/name in metadata")
 
     result = dict(
         (k.removeprefix("anykap/"), v)

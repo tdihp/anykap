@@ -3,7 +3,6 @@ from subprocess import run, PIPE
 from anykap import envimporter
 import inspect
 from textwrap import dedent
-import pytest
 
 envimporter_src = inspect.getsource(envimporter)
 

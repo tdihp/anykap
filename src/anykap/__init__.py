@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal, NewType
 from dataclasses import dataclass, field, make_dataclass, asdict
-from collections import defaultdict, UserDict, Counter, deque
+from collections import defaultdict, UserDict, deque
 import os
 from pathlib import Path
 import itertools as it
@@ -389,7 +389,7 @@ class SugarStub(SugarExp):
 
     def __getitem__(self, key):
         if not isinstance(key, (str, int)):
-            raise KeyError(f"SugarStub only supports str and int keys")
+            raise KeyError("SugarStub only supports str and int keys")
         return SugarStub(self._stack + (("getitem", key),))
 
     def __getattr__(self, key):
@@ -1093,7 +1093,7 @@ class ShellTask(Task):
                 level = logging.INFO
                 if result != 0:
                     level = logging.WARNING
-                logger.log(level, f"script exit code: %r", result)
+                logger.log(level, "script exit code: %r", result)
                 (artifact.path / self.result_file).write_text(str(result))
                 self.send_event(
                     hq,
@@ -1635,7 +1635,7 @@ def archive_tar(
 ):
     suffix = ".tar"
     tarmode = "w"
-    if not compressor in (None, "gz", "bz2", "xz"):
+    if compressor not in (None, "gz", "bz2", "xz"):
         raise ValueError(f"invalid compressor {compressor!r}")
     if compressor:
         suffix += "." + compressor

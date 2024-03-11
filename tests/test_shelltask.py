@@ -1,6 +1,5 @@
 from anykap import *
 import signal
-import pytest
 
 
 async def test_shelltask_simple(hq, hqtask):

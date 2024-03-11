@@ -2,7 +2,7 @@
 # from inspect import getsource
 # import zipfile
 import pytest
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 from anykap import *
 
 
