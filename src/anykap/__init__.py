@@ -1653,7 +1653,6 @@ def archive_tar(
 
 
 def archive_zip(datapath: str, outpath: str, basedir: str = None, **kwargs):
-
     basedir = basedir or os.path.basename(datapath)
     stack = contextlib.ExitStack()
     with stack:

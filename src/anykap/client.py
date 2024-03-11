@@ -309,7 +309,6 @@ def cmd_artifacts(parser, args, kubectl_args):
                     logger.debug("skipping already uploaded artifact %s", a["name"])
                     continue
                 try:
-
                     logger.info("copying artifact %s", a["name"])
                     tar_copy_artifact(
                         ("-n", namespace, pod) + tuple(kubectl_args),
