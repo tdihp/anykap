@@ -542,9 +542,7 @@ class FutureReceptor(Receptor):
     def get_nowait(self):
         return self.value
 
-    async def get(
-        self,
-    ):
+    async def get(self):
         # done, pending = await asyncio.wait([self.future], timeout=timeout)
         # regardless of timeout or not, we return the value.
         loop = asyncio.get_running_loop()
@@ -662,7 +660,7 @@ class Task(FilterMixin):
     """
 
     name: Optional[str] = None
-    context: Any = None
+    context: dict = field(default_factory=dict)
     milestones: Milestones = field(init=False, default_factory=Milestones)
     warnings: Iterable[str] = field(
         init=False, default_factory=partial(deque, maxlen=3)
@@ -776,12 +774,7 @@ class Task(FilterMixin):
 
 
 class HQ:
-    """
-    A one for all manager for Tasks, Rules, Artifacts
-    rules: a list of functions to react on events. Rules can be added,
-           not removed
-    tasks: a list of Task objects
-    """
+    """A one for all manager for Tasks, Rules, Artifacts."""
 
     def __init__(self, name=None, datapath=None):
         """by default we use cwd as datapath"""
@@ -801,6 +794,10 @@ class HQ:
         self.artifacts = []
         self.name = name or sanitize_name(platform.node())
         self.logger = logger.getChild("HQ")
+        # we log max 8 warnings for visual cue
+        self.warnings: Iterable[str] = deque(maxlen=8)
+        self.events_processed = 0
+        logger.addHandler(LastLogs(self.warnings))  # we target all anykap logs
 
     async def run(self):
         assert not self.running
@@ -873,6 +870,7 @@ class HQ:
                 f(event)
             except Exception:
                 logger.exception("failed when calling rule %r on item %r", f, event)
+        self.events_processed += 1
 
     def add_task(self, task):
         """add a new task to hq"""
@@ -920,6 +918,18 @@ class HQ:
 
     def forget_artifact(self, artifact):
         self.artifacts.remove(artifact)
+
+    def asdict(self):
+        """Show critical information of the HQ."""
+        return {
+            "name": self.name,
+            "tasks_all": len(self.tasks) + len(self.done_tasks),
+            "tasks_running": len(self.tasks),
+            "rules": len(self.rules),
+            "artifacts": len(self.artifacts),
+            "warnings": self.warnings,
+            "events_processed": self.events_processed,
+        }
 
 
 # ------------------------------------------------------------------------------
@@ -1105,30 +1115,48 @@ class REPLHelp(BaseException):
 
 
 class REPLServerProtocol(asyncio.Protocol):
-    r"""A way user can interact with HQ for some simple actions
-    It is also a "task" because why not?
+    r"""A human friendly wire protocol for limited REPL style communication.
 
-    Protocol:
-        request:
-            always single line ends with os.linesep with pattern:
-                <cmd> [<param1> <param2> ...]
-            Both cmd and param goes through shlex, so they can be quoted.
-            exit/quit is a protocol level command that causes the server to
-            directly hang up without sending a response.
-        response:
-            starts with a status line of OK/ERR, several content lines, ends
-            with a empty line:
-                <STATUS>
-                <non-empty-data>
-                <non-empty-data>
-                ...
-                <empty new line>
-            For ERR, the following lines will show error specific data,
-            Server will disconnect after sending the full ERR message.
-            for OK, meaningful content.
-        Noting that newline is the only control charater that should always be
-        honored. (Yes this is a limited protocol, not for binary/arbitary
-        transfer)
+    Protocol
+    --------
+
+    Request:
+
+        A single line of text ends with newline (defaults to ``\r\n``) with
+        pattern::
+
+            [<cmd> <param1> <param2> ...]
+
+        shlex.split is used to parse the line, so shell-style quotation is
+        supported. exit/quit is a protocol level command recognized by server,
+        it directly hang up without sending any response.
+
+        Example:
+
+            mycommand  'my "param"'
+
+        will be interpreted as:
+
+            ["mycommand", 'my "param"']
+
+    Response:
+
+        Starts with a status line of OK/ERR, followed by any number of non-empty
+        content lines, ends with one empty line:
+
+            <STATUS>
+            <non-empty-data>
+            <non-empty-data>
+            ...
+            <empty new line>
+
+        For ERR, the following lines will show error specific data,
+        Server will disconnect after sending the full ERR message.
+        for OK, meaningful content.
+
+    Noting that newline is the only control charater that should always be
+    honored. (Yes this is a limited protocol, not for binary/arbitary
+    transfer)
 
     User can use `nc -CU <file>` to access the unix socket for plain text
     interaction.
@@ -1328,16 +1356,12 @@ def make_hq_replserver_parser(
         action="store_true",
         help="stop tasks if provided, otherwise list tasks",
     )
-    # tasks.add_argument('--show-stopped', action='store_true',
-    #                     help='show stopped tasks as well')
     artifacts = subparsers.add_parser(
         "artifacts",
         aliases=["a", "artifact"],
         help="artifact management",
         parents=parents + [common],
     )
-    # artifacts.add_argument('--show-incomplete', action='store_true',
-    #                        help='show incomplete artifacts as well')
     artifacts.add_argument(
         "--mark-uploaded",
         action="store_true",
@@ -1420,6 +1444,12 @@ class HQREPLServer(REPLServer):
                 return [item for item in items if item.name in args.name]
         return items
 
+    def cmd_info(self, args):
+        result = self.hq.asdict()
+        if args.output == "json":
+            return [json.dumps(result, **self.JSON_KW)]
+        return [(k + "\t" + json.dumps(v, **self.JSON_KW)) for k, v in result.items()]
+
     def cmd_tasks(self, args):
         if not args.name and args.stop:
             self.parser.error("task name must exist for stop")
@@ -1452,9 +1482,6 @@ class HQREPLServer(REPLServer):
     def cmd_send(self, args):
         event = args.event
         self.send_event(self.hq, event)
-        return []
-
-    def cmd_info(self, args):
         return []
 
 
@@ -1998,7 +2025,7 @@ class PodContainerDiscovery(PeriodicTask):
 
 # -------------
 # Utility rules
-# --------------
+# -------------
 
 
 def _validate_period(v: Union[float, datetime.timedelta]):
@@ -2014,16 +2041,19 @@ def _validate_period(v: Union[float, datetime.timedelta]):
 
 class DelayRule(Rule, FilterMixin):
     """Generates a new event if a given event triggers.
+
     Duplcated triggering events are aggregated to a single event.
-    Structure of the fired event will be:
-    {
-        "kind": "delay",
-        "name": "{self.name}",
-        "first_event": <original-event>
-        "first_seen": datetime,
-        "last_seen": datetime,
-        "count": 1,
-    }
+    Structure of the fired event will be::
+
+        {
+            "kind": "delay",
+            "name": "{self.name}",
+            "first_event": <original-event>
+            "first_seen": datetime,
+            "last_seen": datetime,
+            "count": 1,
+        }
+
     An optional throttle period can be provided, to block events after a flush.
     DelayRule[filter] is a simple starter for building conditions by filtering
     for the delayrule's identity. It uses the rule's name parameter as the
@@ -2098,10 +2128,12 @@ class FissionRule(Rule, FilterMixin):
     """
     templating method for creating & adding new tasks.
     task_factory has a few requirements:
-    * should return exactly 1 task object
-    * name must be a keyword parameter, must be passed to Task
-    * context must be a keyword parameter, must be a dict if provided, must be
-      passed to Task
+
+    * Should return exactly 1 task object.
+    * ``name`` must be a keyword parameter, must be passed to Task.
+    * ``context`` must be a keyword parameter, must be a dict if provided, must be
+      passed to Task.
+
     FissionRule uses the mutated outcome of the filter as keyword parameters
     of the task_factory, user is responsible for making necessary mutations
     so only needed keywords are passed on.

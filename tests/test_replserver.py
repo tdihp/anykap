@@ -196,3 +196,16 @@ def test_artifacts(hq, hqthread, hqreplserver):
         set(a["name"] for a in json.loads(result[1])["items"]) == {a2.name}
         assert a2.upload_state == "completed"
         assert a2.upload_url == "<manual>"
+
+
+def test_info(hq, hqthread, hqreplserver):
+    hq.add_task(hqreplserver)
+    hqthread.start()
+    with contextlib.closing(REPLClient(hqreplserver.path)) as replclient:
+        result = replclient.query("info")
+        assert result[0] == "OK"
+
+        # we no longer test exact content for the text output
+        result = replclient.query("-o", "json", "info")
+        assert result[0] == "OK"
+        assert json.loads(result[1])["tasks_running"] == 1

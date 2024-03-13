@@ -129,7 +129,7 @@ async def test_cridiscovery(hq, hqtask):
     event_base = {
         "objtype": "dummy",
         "task_name": "cridiscovery-0",
-        "context": None,
+        "context": {},
         "kind": "discovery",
     }
     for (item, expected), actual in zip(test_ladder, results):
