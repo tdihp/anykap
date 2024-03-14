@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from typing import Optional, Any, Type, Union, Literal, NewType, Iterable
 from dataclasses import dataclass, field, asdict
-from functools import partial
 from collections import defaultdict, UserDict, deque
 import os
 from pathlib import Path
@@ -490,91 +489,20 @@ class Rule:
     action: EventProcessor
     count = 0
 
+    def __init__(self, filter: FilterBase, action: EventProcessor):
+        # this is a optional easy initialization, subclassing Rule don't need to
+        # do super if filter and action is provided via methods.
+        self.filter = filter
+        self.action = action
+
+    def action_ex(self, mutated, event):
+        self.action(mutated)
+
     def __call__(self, event):
         verdict, mutated = self.filter(event)
         if verdict:
             self.count += 1
-            self.action(mutated, event)
-
-
-class Receptor(Rule):
-    def __init__(self, filters=None):
-        self.filter = AlternativeFilter(*(filters or []))
-
-    def add_filter(self, *args):
-        self.filter.add_filter(*args)
-
-    def action(self, mutated, event):
-        self.send(mutated)
-
-    def send(self, event):
-        raise NotImplementedError
-
-    def get_nowait(self):
-        """get everything of the receptor"""
-        raise NotImplementedError
-
-    async def get(self, timeout=None):
-        """returns None if times out"""
-        return self.get_nowait()
-
-
-class FutureReceptor(Receptor):
-    """a future -> value receptor, only wait once,
-    typical for exit receptor"""
-
-    def __init__(self, filters=None, initial_value=False):
-        super().__init__(filters=filters)
-        # self.future = asyncio.Future()
-        self._waiters = set()
-        self.value = initial_value
-
-    def send(self, event):
-        self.value = event
-        while self._waiters:
-            waiter = self._waiters.pop()
-            if not waiter.done():
-                waiter.set_result(event)
-
-    def get_nowait(self):
-        return self.value
-
-    async def get(self):
-        # done, pending = await asyncio.wait([self.future], timeout=timeout)
-        # regardless of timeout or not, we return the value.
-        loop = asyncio.get_running_loop()
-        waiter = asyncio.Future(loop=loop)
-        self._waiters.add(waiter)
-        try:
-            await waiter
-        except:
-            waiter.cancel()
-            self._waiters.discard(waiter)
-            raise
-        return self.value
-
-
-class QueueReceptor(Receptor):
-    def __init__(self, filters=None):
-        super().__init__(filters=filters)
-        self.queue = queue.Queue()
-
-    def send(self, event):
-        self.queue.put_nowait(event)
-
-    def get_nowait(self):
-        """get one item from queue with optional timeout. Return None if
-        nothing available.
-        """
-        try:
-            event = self.queue.get_nowait()
-        except queue.QueueEmpty:
-            return None
-        self.queue.task_done()
-        return event
-
-    async def get(self):
-        return await self.queue.get()
+            self.action_ex(mutated, event)
 
 
 @dataclass
@@ -649,7 +577,6 @@ class Artifact:
 task_dataclass = dataclass(eq=False, unsafe_hash=False)
 
 
-@task_dataclass
 class Task(FilterMixin):
     """
     task[filter,...] should construct a Filter object that can be replied on to
@@ -657,30 +584,33 @@ class Task(FilterMixin):
     """
 
     name: Optional[str] = None
-    context: dict = field(default_factory=dict)
     milestones: Milestones = field(init=False, default_factory=Milestones)
-    warnings: Iterable[str] = field(
-        init=False, default_factory=partial(deque, maxlen=3)
-    )
     # XXX: counters, recent events
     counterdict = defaultdict(it.count)
 
-    def __post_init__(self):
-        if self.name is None:
+    def __init__(
+        self,
+        *,
+        name: Optional[str] = None,
+        context: Optional[dict] = None,
+        rules: Iterable[EventProcessor] = None,
+    ):
+        if name is None:
             clsname = sanitize_name(self.__class__.__name__)
             id_ = next(self.counterdict[clsname])
-            self.name = f"{clsname}-{id_}"
-
-        if not validate_name(self.name):
-            raise ValueError(
-                f"given name {self.name} is not valid, please sanitize first"
-            )
-
-        # each task can have fixed number of receptors to subscribe events
-        self.logger = logger.getChild(self.__class__.__name__).getChild(self.name)
-        self.receptors = {"exit": FutureReceptor()}
+            name = f"{clsname}-{id_}"
+        if not validate_name(name):
+            raise ValueError(f"given name {name} is not valid, please sanitize first")
+        self.name = name
+        self.context = context or {}
+        self.rules = list(rules) if rules else []
+        self.warnings = deque(maxlen=3)
+        self.milestones = Milestones()
+        self.logger = logger.getChild(self.__class__.__name__).getChild(name)
         self.logger.addHandler(LastLogs(self.warnings))
         self._task = None
+        self._exit_issued = False
+        self._exit_reason = None
         self.milestones.add("created")
 
     @property
@@ -689,53 +619,28 @@ class Task(FilterMixin):
 
     @property
     def exiting(self):
-        return self.running and self.need_exit()
+        return self.running and self._exit_issued
 
-    def exit(self):
+    def exit(self, reason=None):
         """method to directly terminate this task"""
-        self.receptors["exit"].send(True)
-
-    def need_exit(self):
-        """should be tested in run"""
-        return self.receptors["exit"].get_nowait()
-
-    async def wait_exit(self):
-        return await self.receptors["exit"].get()
+        if self.running and not self.exiting:
+            self.logger.info("sending cancel to task")
+            self._exit_issued = True
+            self._exit_reason = reason
+            self._task.cancel()
+        else:
+            self.logger.warning("exit called but ignored")
 
     async def run(self, hq):
-        run_task = asyncio.create_task(self.run_task(hq), name=f"{self.name}-run_task")
-        wait_exit_task = asyncio.create_task(
-            self.wait_exit(), name=f"{self.name}-wait_exit"
-        )
         self.milestones.add("started")
-        done, pending = await asyncio.wait(
-            [run_task, wait_exit_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        logger.debug("done: %s, pending: %s", done, pending)
-        if wait_exit_task in done:
-            assert run_task in pending
-            run_task.cancel()
-            self.milestones.add("exited")
-        else:
-            assert run_task in done
-            assert wait_exit_task in pending
-            wait_exit_task.cancel()
-            self.milestones.add("completed")
-
         try:
-            await wait_exit_task
+            await self.run_task(hq)
         except asyncio.CancelledError:
-            pass
-
-        try:
-            await run_task
-        except asyncio.CancelledError:
-            self.logger.info("task %s canceled", self.name)
+            self.logger.info("canceled")
             self.milestones.add("canceled")
         except Exception:
-            self.logger.exception("task %s encountered error", self.name)
+            self.logger.exception("encountered error")
             self.milestones.add("failed")
-            # XXX: set exceptions as property for repl exposure
 
     async def run_task(self, hq):
         raise NotImplementedError
@@ -758,13 +663,8 @@ class Task(FilterMixin):
             await self._task
 
     def asdict(self):
-        result = asdict(self)
-        result["receptor_counts"] = dict(
-            (k, v.count) for k, v in self.receptors.items()
-        )
-        result["running"] = self.running
-        result["exiting"] = self.exiting
-        return result
+        KEYS = ["name", "context", "milestones", "warnings", "running", "exiting"]
+        return dict((k, getattr(self, k)) for k in KEYS)
 
     def getfilter(self):
         return Filter(condition=lambda event: event.get("task_name") == self.name)
@@ -852,12 +752,13 @@ class HQ:
                 self.done_tasks.append(task)
                 continue
 
-            for f in task.receptors.values():
+            for f in task.rules:
                 try:
                     f(event)
                 except Exception:
                     logger.exception(
-                        "failed when calling receptor for task %s on event %r",
+                        "failed when calling rule %r for task %s on event %r",
+                        f,
                         task,
                         event,
                     )
@@ -872,8 +773,6 @@ class HQ:
     def add_task(self, task):
         """add a new task to hq"""
         # we are assuming tasks are not yet running.
-        # assert task.hq == self
-        # task.receptors['exit'].add_filter()
         self.logger.debug("add task %r", task)
         if not isinstance(task, Task):
             raise ValueError(f"expecting task, got {task!r}")
@@ -934,7 +833,6 @@ class HQ:
 # ------------------------------------------------------------------------------
 
 
-@task_dataclass
 class ShellTask(Task):
     """run shell scripts
 
@@ -951,44 +849,48 @@ class ShellTask(Task):
     are set to prefer text parsing, and regex only supports text.
     """
 
-    script: str = ""
-    nsenter_args: Optional[list[str]] = None
-    shell: str = "bash"
-    shell_args: Optional[float] = None
-    timeout: Optional[float] = None
-    keep_artifact: bool = True
-    encoding: str = "utf-8"
-    errors: str = "replace"
-    stdout_mode: Literal["artifact", "notify", "null"] = "artifact"
-    stderr_mode: Literal["artifact", "notify", "null", "stdout"] = "artifact"
-    stdout_filter: Optional[str] = None
-    stderr_filter: Optional[str] = None
-    stdout_file: str = "sh.stdout"
-    stderr_file: str = "sh.stderr"
-    result_file: str = "sh.result"
-    terminate_timeout: float = 5
-    kill_timeout: float = 1
-    # popen options
-    env: dict[str, str] = None
-    # popen_kw:dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        super().__post_init__()
-        if not self.script:
-            raise ValueError("script is not provided")
-        # XXX: more validations
+    def __init__(
+        self,
+        script: str,
+        *,
+        shell_command: Iterable[str] = ("bash", "-c"),
+        timeout: Optional[float] = None,
+        keep_artifact: bool = True,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+        stdout_mode: Literal["artifact", "notify", "null"] = "artifact",
+        stderr_mode: Literal["artifact", "notify", "null", "stdout"] = "artifact",
+        stdout_filter: Optional[str] = None,
+        stderr_filter: Optional[str] = None,
+        stdout_file: str = "sh.stdout",
+        stderr_file: str = "sh.stderr",
+        result_file: str = "sh.result",
+        terminate_timeout: float = 5,
+        kill_timeout: float = 1,
+        env: dict[str, str] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.script = script
+        self.shell_command = shell_command
+        self.timeout = timeout
+        self.keep_artifact = keep_artifact
+        self.encoding = encoding
+        self.errors = errors
+        self.stdout_mode = stdout_mode
+        self.stderr_mode = stderr_mode
+        self.stdout_filter = stdout_filter
+        self.stderr_filter = stderr_filter
+        self.stdout_file = stdout_file
+        self.stderr_file = stderr_file
+        self.result_file = result_file
+        self.terminate_timeout = terminate_timeout
+        self.kill_timeout = kill_timeout
+        self.env = env
 
     async def run_task(self, hq):
         logger = self.logger
-        args = [self.shell]
-        if self.shell_args:
-            args.extend(self.shell_args)
-
-        args += ["-c", self.script]
-
-        if self.nsenter_args:
-            args[0:0] = ["nsenter"] + self.nsenter_args
-
+        args = tuple(self.shell_command) + (self.script,)
         # by default, we simply write to artifact directory
         async with contextlib.AsyncExitStack() as stack:
             artifact = stack.enter_context(
@@ -1458,7 +1360,7 @@ class HQREPLServer(REPLServer):
 
         tasks = self.filter_name(args, tasks)
         if args.stop:
-            tasks = list(t for t in tasks if not t.need_exit())
+            tasks = list(t for t in tasks if t.running and not t.exiting)
             for t in tasks:
                 t.exit()
         return self.format_results(args, tasks)
@@ -1510,8 +1412,8 @@ class ArtifactManager(Task):
         name="artifact-manager",
     ):
         super().__init__(name=name)
-        self.receptors["artifact"] = QueueReceptor([Filter(self.filter_event)])
-        # self.receptors['artifact'].add_rule(SimpleRule(self.filter_event))
+        self._queue = asyncio.Queue()
+        self.rules.append(Rule(Filter(self.filter_event), self._queue.put_nowait))
         self.uploader = uploader
         self.archiver = archiver
         self.executor = ThreadPoolExecutor()
@@ -1566,9 +1468,9 @@ class ArtifactManager(Task):
     async def loop(self):
         while True:
             try:
-                event = await self.receptors["artifact"].get()
+                event = await self._queue.get()
             except asyncio.CancelledError:
-                return
+                raise
 
             artifact = event["artifact"]
             try:
@@ -1579,10 +1481,7 @@ class ArtifactManager(Task):
 
     async def run_task(self, hq):
         self.hq = hq
-        loop_task = asyncio.create_task(self.loop(), name=f"{self.name}-loop")
-        await self.wait_exit()
-        loop_task.cancel()
-        await asyncio.wait([loop_task])
+        await self.loop()
 
 
 class CopyUploader(Uploader):
@@ -2084,7 +1983,7 @@ class DelayRule(Rule, FilterMixin):
             self.hq.send_event(self.current_event)
             self.current_event = None
 
-    def action(self, mutated, event):
+    def action_ex(self, mutated, event):
         now = datetime.datetime.now(datetime.timezone.utc)
         if not self.current_event:
             if self.throttle_until and now < self.throttle_until:
@@ -2151,7 +2050,7 @@ class FissionRule(Rule, FilterMixin):
     def next_task_name(self):
         return "-".join(self.name + next(self.counter))
 
-    def action(self, mutated, event):
+    def action_ex(self, mutated, event):
         if not isinstance(mutated, dict):
             raise ValueError("mutated event of FissionRule must be a dict")
 

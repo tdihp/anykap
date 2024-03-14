@@ -1,5 +1,5 @@
 import asyncio
-from anykap import Task
+from anykap import Task, Rule, Filter
 
 
 # failed task run shouldn't fail hq, visually inspect if a message is logged
@@ -26,7 +26,7 @@ async def test_task_exit(hq, hqtask):
             await asyncio.sleep(1000)
 
     task = MyTask()
-    task.receptors["exit"].add_filter(lambda event: event.get("foo") == "bar")
+    task.rules.append(Rule(Filter(lambda event: event.get("foo") == "bar"), task.exit))
     hq.add_task(task)
     await asyncio.sleep(0)
     hq.send_event({"foo": "bar"})

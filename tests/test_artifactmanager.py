@@ -25,7 +25,7 @@ async def test_artifactmanager_working(hq, hqtask, tmp_path):
 
     hq.add_rule(myrule)
     hq.add_task(manager)
-    hq.add_task(MyTask("mytask"))
+    hq.add_task(MyTask(name="mytask"))
     await asyncio.wait_for(result, timeout=1)
     artifact = result.result()
     assert artifact == hq.artifacts[0] and len(hq.artifacts) == 1

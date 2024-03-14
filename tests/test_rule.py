@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import Mock
 import asyncio
 import datetime
-from anykap import Task, FissionRule, Filter, DelayRule, FutureReceptor
+from anykap import Task, FissionRule, Filter, DelayRule
 
 
 def _w(v):
@@ -107,26 +107,3 @@ async def test_delay(hq, hqtask):
         assert 3 <= result["count"] <= 4
         assert result["first_event"] == {"foo": "bar"}
         assert result["name"] == "foobar"
-
-
-async def test_future_receptor():
-    receptor = FutureReceptor()
-    wait_tasks = [asyncio.create_task(receptor.get()) for i in range(10)]
-    await asyncio.sleep(0)  # allow get to be ran
-    receptor.send({"foo1": "bar"})
-    done, pending = await asyncio.wait(wait_tasks, timeout=1)
-    assert len(done) == 10
-    # print('result:', done.pop().result())
-    assert all((t.result() == {"foo1": "bar"}) for t in done)
-    receptor.add_filter(lambda event: event and event.get("foo2") == "bar")
-    wait_tasks = [asyncio.create_task(receptor.get()) for i in range(10)]
-    await asyncio.sleep(0)  # allow get to be ran
-    receptor({"foo2": "bar"})
-    done, pending = await asyncio.wait(wait_tasks, timeout=1)
-    assert len(done) == 10
-    assert all((t.result() is True) for t in done)
-    wait_task = asyncio.create_task(receptor.get())
-    await asyncio.sleep(0)  # allow get to be ran
-    receptor({"foo3": "bar"})
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(wait_task, timeout=0.1)
