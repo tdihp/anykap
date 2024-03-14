@@ -309,9 +309,6 @@ class SugarExp:
         # Due to boolean and or are implemented by __bool__() which requires
         # a boolean outcome, the approach here only works for a restricted
         # setting.
-        # '__not__': ('~',  1, 4),
-        # '__and__': ('&',  2, 8),
-        # '__or__':  ('|',  2, 10),
         "__lt__": ("<", 2, 11),
         "__le__": ("<=", 2, 11),
         "__eq__": ("==", 2, 11),
@@ -1289,7 +1286,7 @@ class REPLHelpAction(argparse.Action):
 
 
 class REPLArgumentParser(argparse.ArgumentParser):
-    """customize argparse to get help"""
+    """A customized ArgumentParser that customizes help for async protocol."""
 
     def __init__(self, *args, add_help=True, **kwargs):
         super().__init__(*args, exit_on_error=False, add_help=False, **kwargs)
