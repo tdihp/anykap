@@ -574,7 +574,31 @@ class Artifact:
         return asdict(self)
 
 
-task_dataclass = dataclass(eq=False, unsafe_hash=False)
+class task_receptor:
+    """Descriptor that marks a Task method as a receptor.
+
+    Receptors are Task methods that takes a single arg indicating a incoming
+    event.
+
+    Methods marked will also add a {name}_at(filter) method automatically,
+    the method adds a rule to the task with the given filter.
+    """
+
+    def __init__(self, func: Callable[[Any, Any], None]):
+        if not callable(func):
+            raise ValueError(f"expecting callable func, got {func!r}")
+        self.func = func
+
+    def __get__(self, obj, cls=None):
+        return self.func.__get__(obj, cls)
+
+    def __set_name__(self, owner, name):
+        def at(self, *args):
+            rule = Rule(build_filter(*args), getattr(self, name))
+            self.rules.append(rule)
+
+        at.__doc__ = f"Add a rule for receptor {name} to owning task {owner}"
+        setattr(owner, f"{name}_at", at)
 
 
 class Task(FilterMixin):
@@ -621,8 +645,9 @@ class Task(FilterMixin):
     def exiting(self):
         return self.running and self._exit_issued
 
+    @task_receptor
     def exit(self, reason=None):
-        """method to directly terminate this task"""
+        """Directly terminate this task."""
         if self.running and not self.exiting:
             self.logger.info("sending cancel to task")
             self._exit_issued = True

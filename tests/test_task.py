@@ -26,6 +26,7 @@ async def test_task_exit(hq, hqtask):
             await asyncio.sleep(1000)
 
     task = MyTask()
+    # task.exit_at(lambda event: event.get("foo") == "bar"))  # equivalent
     task.rules.append(Rule(Filter(lambda event: event.get("foo") == "bar"), task.exit))
     hq.add_task(task)
     await asyncio.sleep(0)
