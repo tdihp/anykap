@@ -776,7 +776,8 @@ class HQ:
                 self.tasks.remove(task)
                 self.done_tasks.append(task)
                 continue
-
+            if task.exiting:  # exiting tasks do not take events anymore
+                continue
             for f in task.rules:
                 try:
                     f(event)
@@ -2080,8 +2081,7 @@ class FissionRule(Rule, FilterMixin):
             raise ValueError("mutated event of FissionRule must be a dict")
 
         params = mutated.copy()
-        if self.name:
-            params.setdefault("name", "-".join([self.name, str(next(self.counter))]))
+        params.setdefault("name", "-".join([self.name, str(next(self.counter))]))
 
         context = params.pop("context", {}) | {
             "task_created_by": "FissionRule",

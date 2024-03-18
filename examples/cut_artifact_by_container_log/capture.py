@@ -16,7 +16,7 @@ discovery = hq.add_task(
             "name": "contoso",  # crictl pods --name supports regular expression
         },
         container_query={},  # maybe we want to find a specific container
-        cadence=60,  # we do a scan every minute
+        cadence=20,  # we do a scan every 20secs
         # inspect_pod=True,  # if we want crictl inspectp output
         # inspect_container=True,  # if we want crictl inspect output
     )
@@ -36,7 +36,7 @@ fission_rule = hq.add_rule(
             stdout_mode="notify",
             # Optional Python regular expression pattern
             stdout_filter="a very curous error: (?P<detail>.*)",
-            script=r'crictl logs -f -t "$container_id"',
+            script=r'crictl logs -f --tail 0 -t "$container_id" ',
         ),
     )
 )
@@ -46,37 +46,39 @@ delay_rule = hq.add_rule(
         fission_rule[e.kind == "shell", e.topic == "line"],
         hq,
         "errorgrep",
-        delay=timedelta(minutes=1),  # we delay for 1 minute to catch more problems
+        delay=10,  # we delay for 10 seconds to catch more of the same messages
         # we throttle for 3 more minutes to avoid frequent bumps
         throttle=timedelta(minutes=3),
     )
 )
 
 
-def tcpdump_factory(**config):
+def tcpdump_factory(name=None, context=None, **ignored):
     task = ShellTask(
-        # why is chmod needed?
+        name=name,
+        context=context,
+        # chmod needed since tcpdump changes owner.
         script=r'chmod 777 .; tcpdump -iany -C10 -W6 -w "out.pcap" port 53',
-        **config,
     )
     # this is the current recommended way to update receptor if receptors needs
     # to be changed on task creation
-    task.receptors["exit"].add_filter(delay_rule.getfilter())
+    task.exit_at(
+        delay_rule.getfilter() | discovery[e.objtype == "pod", e.topic == "last_gone"]
+    )
     return task
 
 
 hq.add_rule(
     FissionRule(
-        delay_rule.getfilter().chain(
-            {}
-        ),  # chain({}) makes sure no args sent to factory
+        (
+            delay_rule.getfilter()
+            | discovery[e.objtype == "pod", e.topic == "first_seen"]
+        ),
         hq,
         name="tcpdump",
         task_factory=tcpdump_factory,
     )
 )
-# the initial tcpdump capture before any trigger
-hq.add_task(tcpdump_factory(name="tcpdump-0"))
 
 
 if __name__ == "__main__":
