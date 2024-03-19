@@ -1,5 +1,18 @@
-anykap - capture things in k8s with your tools, when it matters
-===============================================================
+Anykap: Rule Based Observability in Kubernetes Nodes
+====================================================
+
+Feature
+-------
+
+* A Daemonset based troubleshooting tool. 
+* Event based scripting system for defining your own capture flow.
+* Pod/Container discovery with crictl.
+* Artifact management.
+* Relies on tools that you already know, not re-inventing wheels.
+  Need packet capture? Run tcpdump;
+  Need check io performance? Run your favourite performance tool.
+* No special container image required. General purpose image like alpine works
+  out-of-box.
 
 Installation
 ------------
@@ -12,6 +25,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -U git+https://github.com/tdihp/anykap.git@main
 ```
+
 
 Usage
 -----

@@ -138,6 +138,14 @@ def json_default(o):
     raise TypeError(f"unable to convert {o!r} to json")
 
 
+def _optionalrepr(self, keys):
+    return ", ".join(
+        "{}={!r}".format(k, getattr(self, k))
+        for k in ["condition", "mutator"]
+        if hasattr(self, k) and not hasattr(self.__class__, k)
+    )
+
+
 # -------------
 # Core Concepts
 # -------------
@@ -148,23 +156,35 @@ EventMutator = NewType("EventMutator", Callable[[Event], Any])
 
 
 class FilterBase:
-    """
-    Filter is an abstraction of a single arg callable. Anykap uses Filters to
-    work with events.
-    Filters are callables that takes a single input event,
-    and returns (verdict, mutated).
-    Filters can be "chained" together by .chain(...) or build_filter(...),
-    to build alternating filters use AlternativeFilter() or the '|'
-    operator.
+    """Base of all Filter objects.
+
+    Filters are callables that takes a single input event, and returns
+    ``(verdict: bool, mutated: Any)``.
     """
 
-    def chain(self, *args):
-        """create a chained filter"""
+    def __call__(self, event: Any) -> tuple[bool, Any]:
+        """Making a call to the filter.
+
+        :param Any event: the input event
+        :returns: verdict and mutated event, caller should ignore the mutated
+                  event if verdict is False.
+        """
+        raise NotImplementedError
+
+    def chain(self, *args) -> "FilterChain":
+        """Chains multiple filters together.
+
+        All arguments are passed to :py:func:`build_filter`.
+        """
         if not args:
             raise ValueError("empty args for chain")
         return build_filter(self, *args)
 
-    def __or__(self, other):
+    def __or__(self, other) -> "AlternativeFilter":
+        """Build alternating filters with ``|`` operator.
+
+        Both arguments will be passed to :py:func:`build_filter`.
+        """
         alts = []
         for filter in [self, other]:
             filter = build_filter(filter)
@@ -176,11 +196,22 @@ class FilterBase:
         return AlternativeFilter(*alts)
 
 
-def build_filter(*args):
-    """build a filter according to given parameters.
-    If more than one parameters are given, all filters will be chained together.
-    In addition to all instances of FilterBase, this builder also accepts dicts
-    as a mutator, and SugarExp as a condition.
+def build_filter(*args: Any) -> FilterBase:
+    """Facade for creating Filter objects.
+
+    If more than one arguments are given, all will chained together forming a
+    :py:class:`FiletrChain`.
+
+    For each argument:
+
+    * :py:class:`FilterChain` instances are unnested into the final chain;
+    * Other :py:class:`FilterBase` instances are kept as-is;
+    * :py:class:`SugarOp` instances are wrapped as condition-only
+      :py:class:`Filter`;
+    * Python dicts are converted to :py:class:`SugarLiteral` instances;
+    * :py:class:`SugarLiteral` instances are wrapped as mutation-only
+      :py:class:`Filter`;
+    * Other callable objects are wrapped as :py:class:`FilterWrapper`.
     """
     if not args:
         raise ValueError("build_filter with empty args")
@@ -209,9 +240,18 @@ def build_filter(*args):
 
 
 class Filter(FilterBase):
-    """A basic filter that takes a condition and a mutator."""
+    """A basic filter that takes a condition and a mutator.
 
-    def __init__(self, condition=None, mutator=None):
+    Mutator will only be called if the condition function succeeds.
+    User can choose to either input condition and mutator functions as inputs,
+    or to subclass and implement input and filter as methods.
+    """
+
+    def __init__(
+        self,
+        condition: Optional[Callable[[Any], bool]] = None,
+        mutator: Optional[Callable[[Any], Any]] = None,
+    ):
         if condition:
             if not callable(condition):
                 raise ValueError(f"condition {condition!r} not callable")
@@ -233,11 +273,25 @@ class Filter(FilterBase):
             mutated = self.mutator(event)
         return verdict, mutated
 
+    def __repr__(self):
+        # we only print available functions that aren't defined in class
+        funcs = _optionalrepr(self, ["condition", "mutator"])
+        return f"{self.__class__.__name__}({funcs})"
+
 
 class FilterWrapper(FilterBase):
     """Wraps a function a into a filter.
+
     if return value of given function is None or False, then verdict is False.
-    Otherwise verdict is True and the return value is passed as-is
+    Otherwise verdict is True and the return value is passed as the mutation
+    result.
+
+    Noting this means empty dict or list will be treated as True verdicts.
+
+    FilterWrapper can be an easy way to construct Filter instance with lambda.
+    For example, ``FilterWrapper(lambda x: x.get("foo") == bar and "foobar")``
+    will give ``"foobar"`` as mutation value only when input dictionary includes
+    a key ``"foo"`` with ``"bar"`` as its value.
     """
 
     def __init__(self, f):
@@ -251,13 +305,23 @@ class FilterWrapper(FilterBase):
             return False, None
         return True, result
 
+    def __repr__(self):
+        return f"FilterWrapper({self._f!r})"
+
 
 class FilterChain(FilterBase):
-    """chained filters. use Filter.chain or build_filter to construct this"""
+    """Multiple filters chained together.
+
+    On evaluation, all input Filters will be evaluated in the input order.
+    If any of the filters give False verdict, evaluation finishes with a False
+    verdict.
+
+    Consider using :py:func:`build_filter` to construct.
+    """
 
     def __init__(self, *filters):
-        if not filters:
-            raise ValueError("empty chain")
+        if len(filters) < 2:
+            raise ValueError("not enough inputs for constructing FilterChain")
         self._filters = tuple(filters)
         if not all(isinstance(filter, FilterBase) for filter in self._filters):
             raise ValueError(f"not all filters FilterBase: {self._filters!r}")
@@ -271,24 +335,31 @@ class FilterChain(FilterBase):
                 return False, None
         return verdict, mutated
 
+    def __repr__(self):
+        return f"FilterChain{self._filters}"
+
 
 class AlternativeFilter(FilterBase):
-    """build alternatives
-    This filter doesn't process exceptions for any of the filters given,
-    user need to make sure all alternatives doesn't raise exceptions
+    """Alternative filters.
+
+    Evaluates each of the filters in order, and return the result of the first
+    filter that has True verdict. If all filters fail, the result is failed.
+
+    Consider using ``|`` operator to construct.
     """
 
     def __init__(self, *filters: FilterBase):
-        self._filters = []
+        if len(filters) < 2:
+            raise ValueError("not enough inputs for constructing AlternativeFilter")
+        result = []
         for filter in filters:
-            self.add_filter(filter)
-
-    def add_filter(self, *args):
-        filter = build_filter(*args)
-        if isinstance(filter, AlternativeFilter):
-            self._filters.extend(filter._filters)
-        else:
-            self._filters.append(filter)
+            if isinstance(filter, AlternativeFilter):
+                result.extend(filter._filters)
+            else:
+                result.append(filter)
+        self._filters = tuple(result)
+        if not all(isinstance(filter, FilterBase) for filter in self._filters):
+            raise ValueError(f"not all filters FilterBase: {self._filters!r}")
 
     def __call__(self, event):
         for filter in self._filters:
@@ -296,6 +367,9 @@ class AlternativeFilter(FilterBase):
             if verdict:
                 return verdict, mutated
         return False, None
+
+    def __repr__(self):
+        return f"AlternativeFilter{self._filters!r}"
 
 
 class SugarExp:
@@ -475,7 +549,7 @@ class SugarLiteral(SugarExp):
         return self._walk(self._obj, lambda x: x(event))
 
     def _repr(self):
-        return repr(self._obj)
+        return f"SugarLiteral({self._obj!r})"
 
 
 class Rule:
