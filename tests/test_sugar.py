@@ -31,7 +31,10 @@ def test_sugarliteral():
 
 
 def test_sugarop():
-    assert repr(SugarLiteral("a") == SugarLiteral("b")) == "SugarOp('a' == 'b')"
+    assert (
+        repr(SugarLiteral("a") == SugarLiteral("b"))
+        == "SugarOp(SugarLiteral('a') == SugarLiteral('b'))"
+    )
     e = SugarStub()
     assert (e.abc == [1, 2, 3])({"abc": [1, 2, 3]}) is True
     assert (e.abc == [1, 2, 3])({"abc": [1, 2]}) is False

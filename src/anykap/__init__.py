@@ -3,6 +3,7 @@ from typing import Optional, Any, Type, Union, Literal, NewType, Iterable
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict, UserDict, deque
 import os
+import sys
 from pathlib import Path
 import itertools as it
 import asyncio
@@ -32,6 +33,9 @@ import logging
 __version__ = "0.1.0-dev"
 USER_AGENT = f"anykap/{__version__}"
 logger = logging.getLogger("anykap")
+
+if sys.version_info[0] != 3 or sys.version_info[1] < 9:
+    logger.warning("untested Python interpreter %s", sys.version)
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -282,7 +286,7 @@ class Filter(FilterBase):
 class FilterWrapper(FilterBase):
     """Wraps a function a into a filter.
 
-    if return value of given function is None or False, then verdict is False.
+    If return value of given function is None or False, then verdict is False.
     Otherwise verdict is True and the return value is passed as the mutation
     result.
 
@@ -947,6 +951,24 @@ class ShellTask(Task):
 
     Since we should be dealing with text here, all subprocess.Popen parameters
     are set to prefer text parsing, and regex only supports text.
+
+    Anykap configures ``setsid()`` on the shell process, so it has a unique sid
+    and process group, without control terminal.
+
+    .. caution ::
+
+        Anykap doesn't prevent subprocesses from forking, and doesn't do
+        anything special to terminate or reap grandchildren processes. If the
+        script forks (such as using ``&`` operator in bash), anykap expect user
+        to cleanup upon terminating, e.g., configure trap for SIGTERM.
+
+        Example of such trap line looks like this::
+
+            trap 'J="$(jobs -p)"; [ ! -z "$J" ] && kill $JOBS && wait' EXIT
+            # or to kill the process group
+            trap 'kill -- -$$ && wait' EXIT
+            # or to use pkill to kill all children
+            trap 'pkill -P $$ && wait' EXIT
     """
 
     def __init__(
@@ -1020,6 +1042,7 @@ class ShellTask(Task):
                 stdout=stdout,
                 stderr=stderr,
                 env=self.env,
+                start_new_session=True,
             )
             notify_tasks = []
             if self.stdout_mode == "notify":
@@ -1067,6 +1090,7 @@ class ShellTask(Task):
                 if result != 0:
                     level = logging.WARNING
                 logger.log(level, "script exit code: %r", result)
+
                 (artifact.path / self.result_file).write_text(str(result))
                 self.send_event(
                     hq,
@@ -1116,15 +1140,16 @@ class REPLHelp(BaseException):
 class REPLServerProtocol(asyncio.Protocol):
     r"""A human friendly wire protocol for limited REPL style communication.
 
-    Protocol
-    --------
+    The protocol is a stream protocol. Each connection can serve multiple
+    requests-response pairs. Each pair includes exactly one request, sending
+    from client to server, and one response, sending from server to client.
 
-    Request:
+    Request::
 
         A single line of text ends with newline (defaults to ``\r\n``) with
         pattern::
 
-            [<cmd> <param1> <param2> ...]
+            [<cmd>] [<param1>] [<param2>] ...
 
         shlex.split is used to parse the line, so shell-style quotation is
         supported. exit/quit is a protocol level command recognized by server,
@@ -1138,7 +1163,7 @@ class REPLServerProtocol(asyncio.Protocol):
 
             ["mycommand", 'my "param"']
 
-    Response:
+    Response::
 
         Starts with a status line of OK/ERR, followed by any number of non-empty
         content lines, ends with one empty line:
@@ -1154,11 +1179,10 @@ class REPLServerProtocol(asyncio.Protocol):
         for OK, meaningful content.
 
     Noting that newline is the only control charater that should always be
-    honored. (Yes this is a limited protocol, not for binary/arbitary
-    transfer)
+    honored. This is a limited protocol where request must be in a single line,
+    and response must be provided immediately, and must not contain empty lines
+    other than the ending one. It is by design not for binary/arbitary transfer.
 
-    User can use `nc -CU <file>` to access the unix socket for plain text
-    interaction.
     """
 
     def __init__(self, server, newline=b"\r\n", idle_timeout=300, max_request=1024):
@@ -1308,7 +1332,15 @@ class REPLArgumentParser(argparse.ArgumentParser):
 
 
 class REPLServer(Task):
-    parser = argparse.ArgumentParser("replserver")
+    """
+    Blank server implementation of repl protocol :py:class:`REPLServerProtocol`
+    using a unix socket.
+
+    User can use `nc -CU <file>` to access the unix socket for plain text
+    interaction.
+    """
+
+    parser = REPLArgumentParser("replserver")
 
     def __init__(self, path, name="replserver", **kwargs):
         """
@@ -1377,6 +1409,10 @@ def make_hq_replserver_parser(
 
 
 class HQREPLServer(REPLServer):
+    """
+    Concrete implementation of full repl functionality needed by anykap.
+    """
+
     TASK_KEYS = ["name", "running", "exiting", "milestones", "warnings"]
     ARTIFACT_KEYS = ["name", "state", "path", "upload_state", "upload_url"]
     JSON_KW = {
@@ -2186,4 +2222,7 @@ class FissionRule(Rule, FilterMixin):
 
 def main(hq):
     logging.basicConfig(level=logging.DEBUG)
+    if platform.system() != "Linux":
+        logger.warning("non-linux system %s", platform.system())
+
     asyncio.run(hq.run())
