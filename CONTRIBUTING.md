@@ -39,3 +39,7 @@ For testing Azure blob,
 For running tests:
 
     hatch run pytest --cov src/anykap
+
+For building documentation:
+
+    hatch run docs:build

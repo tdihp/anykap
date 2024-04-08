@@ -1,6 +1,6 @@
 [project]
 name = "anykap"
-description = "A simple toolkit aiding capturing in Kubernetes Linux nodes"
+description = "Rule Based Observability in Kubernetes Nodes"
 requires-python = ">=3.9"
 authors = [
     {name = "Ping He", email="tdihp@hotmail.com"},
@@ -41,7 +41,6 @@ dependencies = [
 python = ["3.9", "3.10", "3.11", "3.12"]
 
 [tool.hatch.envs.lint]
-template = "lint"
 detached = true
 dependencies = [
   "black",
@@ -51,6 +50,15 @@ dependencies = [
 [tool.hatch.envs.lint.scripts]
 lint = ["black --check --diff {args:.}", "ruff check {args:.}"]
 format = ["black {args:.}", "ruff format {args:.}"]
+
+[tool.hatch.envs.docs]
+dependencies = [
+  "sphinx ~= 7.2.6",
+  "myst-parser ~= 2.0.0",
+]
+
+[tool.hatch.envs.docs.scripts]
+build = "make -C docs html"
 
 [tool.ruff]
 target-version = "py39"
