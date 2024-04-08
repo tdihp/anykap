@@ -1141,48 +1141,51 @@ class REPLServerProtocol(asyncio.Protocol):
     r"""A human friendly wire protocol for limited REPL style communication.
 
     The protocol is a stream protocol. Each connection can serve multiple
-    requests-response pairs. Each pair includes exactly one request, sending
-    from client to server, and one response, sending from server to client.
+    requests-response pairs one after another. Each pair includes exactly one
+    request, sending from client to server, and one response, sending from
+    server to client.
 
-    Request::
+    Request is a single line of text ends with newline (defaults to ``\r\n``)
+    with pattern::
 
-        A single line of text ends with newline (defaults to ``\r\n``) with
-        pattern::
+        [<cmd>] [<param1>] [<param2>] ...
 
-            [<cmd>] [<param1>] [<param2>] ...
+    `shlex.split<https://docs.python.org/3/library/shlex.html#shlex.split>`_
+    is used to parse the line, so shell-style quotation is supported.
+    Implementations can supply multiple valid commands which supports various
+    parameters, while ``exit``/``quit`` is a protocol level command recognized
+    by server, it directly hang up without sending any response.
 
-        shlex.split is used to parse the line, so shell-style quotation is
-        supported. exit/quit is a protocol level command recognized by server,
-        it directly hang up without sending any response.
+    A example request line looks like this::
 
-        Example:
+        mycommand  'my "param"'\r\n
 
-            mycommand  'my "param"'
+    It will be interpreted as::
 
-        will be interpreted as:
+        ["mycommand", 'my "param"']
 
-            ["mycommand", 'my "param"']
+    Response starts with a status line of ``OK``/``ERR``, followed by any number
+    of non-empty content lines, ends with one empty line::
 
-    Response::
+        <STATUS>
+        <non-empty-data>\r\n
+        <non-empty-data>\r\n
+        ...
+        \r\n
 
-        Starts with a status line of OK/ERR, followed by any number of non-empty
-        content lines, ends with one empty line:
+    For OK response, meaningful content will be sent immediately after the
+    status.
 
-            <STATUS>
-            <non-empty-data>
-            <non-empty-data>
-            ...
-            <empty new line>
+    For ERR, the following lines will show error detail, Server will disconnect
+    after sending the full ERR message.
 
-        For ERR, the following lines will show error specific data,
-        Server will disconnect after sending the full ERR message.
-        for OK, meaningful content.
+    .. note ::
 
-    Noting that newline is the only control charater that should always be
-    honored. This is a limited protocol where request must be in a single line,
-    and response must be provided immediately, and must not contain empty lines
-    other than the ending one. It is by design not for binary/arbitary transfer.
-
+        Newline (``\r\n``) is the only control charater that should always be
+        honored. This is a limited protocol where request must be in a single
+        line, and response must be provided immediately, and must not contain
+        empty lines other than the ending one. It is by design not suitable for
+        binary/arbitary transfer.
     """
 
     def __init__(self, server, newline=b"\r\n", idle_timeout=300, max_request=1024):
