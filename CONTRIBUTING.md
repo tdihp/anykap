@@ -42,4 +42,9 @@ For running tests:
 
 For building documentation:
 
-    hatch run docs:build
+    hatch run docs:make -C docs html
+
+You'll find html docs available at `docs/_build/html`. To visit, either open the
+`index.html` directly or host it locally by
+`python3 -m http.server --directory docs/_build/html`, then visit
+[127.0.0.1:8000] in browser.
