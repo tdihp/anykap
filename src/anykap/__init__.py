@@ -1150,7 +1150,7 @@ class REPLServerProtocol(asyncio.Protocol):
 
         [<cmd>] [<param1>] [<param2>] ...
 
-    `shlex.split<https://docs.python.org/3/library/shlex.html#shlex.split>`_
+    `shlex.split <https://docs.python.org/3/library/shlex.html#shlex.split>`_
     is used to parse the line, so shell-style quotation is supported.
     Implementations can supply multiple valid commands which supports various
     parameters, while ``exit``/``quit`` is a protocol level command recognized
@@ -1339,7 +1339,7 @@ class REPLServer(Task):
     Blank server implementation of repl protocol :py:class:`REPLServerProtocol`
     using a unix socket.
 
-    User can use `nc -CU <file>` to access the unix socket for plain text
+    User can use ``nc -CU <file>`` to access the unix socket for plain text
     interaction.
     """
 
