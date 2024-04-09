@@ -47,4 +47,4 @@ For building documentation:
 You'll find html docs available at `docs/_build/html`. To visit, either open the
 `index.html` directly or host it locally by
 `python3 -m http.server --directory docs/_build/html`, then visit
-[127.0.0.1:8000] in browser.
+http://127.0.0.1:8000 in browser.
