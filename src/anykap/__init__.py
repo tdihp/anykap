@@ -776,17 +776,35 @@ class Task(FilterMixin):
 class HQ:
     """A one for all manager for Tasks, Rules, Artifacts."""
 
-    def __init__(self, name=None, datapath=None):
-        """by default we use cwd as datapath"""
-        # self.tasks = set()
+    def __init__(
+        self,
+        name=None,
+        datapath=None,
+        max_running_tasks: int = None,
+        max_done_tasks: int = None,
+        max_rules: int = None,
+        max_artifacts: int = None,
+    ):
         self.tasks = []
-        self.done_tasks = []  # to accelerate
         self.rules = []
         datapath = datapath or os.environ.get("ANYKAP_DATAPATH", os.getcwd())
         self.datapath = Path(datapath).absolute()
-        logger.info("hq datapath: %s", self.datapath)
         if not self.datapath.is_dir():
             logger.warning("supplied datapath for hq %s not a directory", self.datapath)
+        logger.info("hq datapath: %s", self.datapath)
+        self.max_running_tasks = max_running_tasks or int(
+            os.environ.get("ANYKAP_MAX_RUNNING_TASKS", 100)
+        )
+        logger.info("max_running_tasks: %s", self.max_running_tasks)
+        max_done_tasks = max_done_tasks or int(
+            os.environ.get("ANYKAP_MAX_DONE_TASKS", 100)
+        )
+        logger.info("max_done_tasks: %s", max_done_tasks)
+        self.done_tasks = deque(maxlen=max_done_tasks)
+        self.max_rules = max_rules or int(os.environ.get("ANYKAP_MAX_RULES", 100))
+        self.max_artifacts = max_artifacts or int(
+            os.environ.get("ANYKAP_MAX_ARTIFACTS", 100)
+        )
         self.running = False
         self._quit = None  # external trigger for test
         self.queue = queue.Queue()
@@ -858,6 +876,7 @@ class HQ:
                 continue
             for f in task.rules:
                 try:
+                    logger.debug("evaluating task %r rule %r", task, f)
                     f(event)
                 except Exception:
                     logger.exception(
@@ -869,6 +888,7 @@ class HQ:
 
         for f in self.rules:
             try:
+                logger.debug("evaluating global rule %r", f)
                 f(event)
             except Exception:
                 logger.exception("failed when calling rule %r on item %r", f, event)
@@ -882,14 +902,20 @@ class HQ:
             raise ValueError(f"expecting task, got {task!r}")
         if task in self.tasks:
             raise RuntimeError(f"task {task!r} already in hq, maybe name dup?")
-
-        # self.tasks.add(task)
+        if len(self.tasks) >= self.max_running_tasks:
+            raise RuntimeError(
+                f"cannot add task {task!r}, reaching max running tasks {self.max_running_tasks}"
+            )
         self.tasks.append(task)
         if self.running:
             task.start(self)
         return task
 
     def add_rule(self, rule):
+        if len(self.rules) >= self.max_rules:
+            raise RuntimeError(
+                f"cannot add rule {rule!r}, reaching max_rules {self.max_rules}"
+            )
         self.rules.append(rule)
         return rule
 
@@ -898,11 +924,14 @@ class HQ:
         self.queue.put_nowait(event)
 
     def new_artifact(self, name, keep=True, context=None):
+        if len(self.artifacts) >= self.max_artifacts:
+            raise RuntimeError(
+                f"cannot add artifact {name}, reaching max_artifacts {self.max_artifacts}"
+            )
         artifact_name = self.gen_artifact_name(name)
         path = self.datapath / artifact_name
         if path.exists():
-            raise RuntimeError("artifact path %s already exists" % path)
-
+            raise RuntimeError(f"artifact path {path} already exists")
         path.mkdir(parents=True)
         artifact = Artifact(artifact_name, path, keep)
         self.artifacts.append(artifact)
@@ -917,7 +946,11 @@ class HQ:
         return f"{timestamp}-{node_name}-{name}-{cnt}"
 
     def forget_artifact(self, artifact):
-        self.artifacts.remove(artifact)
+        logger.debug("forgetting artifact %s", artifact)
+        try:
+            self.artifacts.remove(artifact)
+        except ValueError:
+            logger.warning("artifact %s not found, skipped", artifact)
 
     def asdict(self):
         """Show critical information of the HQ."""
@@ -1541,21 +1574,13 @@ class ArtifactManager(Task):
     archive -> upload the artifact. Marks artifact uploaded / failed accordingly
     """
 
-    # uploader:Uploader = None
-    # archiver:Callable[[Path], None] = None
-    # def __post_init__
-    def __init__(
-        self,
-        archiver,
-        uploader,
-        name="artifact-manager",
-    ):
-        super().__init__(name=name)
+    def __init__(self, archiver=None, uploader=None, executor=None, **kwargs):
+        super().__init__(**kwargs)
         self._queue = asyncio.Queue()
         self.rules.append(Rule(Filter(self.filter_event), self._queue.put_nowait))
         self.uploader = uploader
         self.archiver = archiver
-        self.executor = ThreadPoolExecutor()
+        self.executor = executor or ThreadPoolExecutor(max_workers=1)
 
     # XXX: handle exceptions and retry. currently we mark artifact as failed
 
@@ -1563,12 +1588,15 @@ class ArtifactManager(Task):
         return event.get("kind") == "artifact" and event.get("topic") == "complete"
 
     async def process_artifact(self, artifact):
+        loop = asyncio.get_running_loop()
         if not artifact.keep:
-            self.logger.info("skipping non-keep artifact %r", artifact)
+            self.logger.info("artifact %r with keep false, destroying", artifact)
+            self.hq.forget_artifact(artifact)
+            await loop.run_in_executor(self.executor, artifact.destroy)
+
         artifact.mark_upload_state("archiving")
         dest_path = self.hq.datapath / "archive"
         dest_path.mkdir(exist_ok=True, parents=True)
-        loop = asyncio.get_running_loop()
         try:
             self.logger.debug(
                 "calling archiver: %s %s %s %s",
@@ -2185,9 +2213,6 @@ class FissionRule(Rule, FilterMixin):
         self.task_factory = task_factory
         self.counter = it.count(1)
         self.filter = build_filter(filter)
-
-    def next_task_name(self):
-        return "-".join(self.name + next(self.counter))
 
     def action_ex(self, mutated, event):
         if not isinstance(mutated, dict):
