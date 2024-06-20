@@ -1,0 +1,26 @@
+metadata:
+  # kubectl-anykap uses kustomize.metadata.annotations to provide extra settings
+  annotations:
+    # used to locate hq datapath and replserver unix socket
+    anykap/name: "httpprobetimeout"
+    anykap/version: "0.1.0-dev"
+    # modify this if need to chroot to a different path
+    # if empty or not provided, means chroot is not necessary
+    anykap/chroot: "/host"
+    # uncomment this if you've specified a different path for the replserver
+    # anykap/serverpath: '/var/run/anykap-httpprobetimeout.sock'
+resources:
+- daemonset.yaml
+commonLabels:
+  app.kubernetes.io/name: anykap
+  app.kubernetes.io/instance: "httpprobetimeout"
+  app.kubernetes.io/managed-by: "kubectl-anykap"
+configMapGenerator:
+- name: env
+  files:
+  - 'envimporter.py'
+  - 'PYMODULE__ANYKAP__AZURE'
+  - 'capture.py'
+  - 'PYMODULE__ANYKAP'
+namePrefix: "httpprobetimeout-"
+# namespace: # specify a namespace if preferred

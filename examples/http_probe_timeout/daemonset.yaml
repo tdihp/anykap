@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: anykap
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      dnsPolicy: "Default"
+      hostIPC: true
+      hostNetwork: true
+      hostPID: true
+      hostUsers: true
+      # securityContext:
+      tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+      - operator: Exists
+        effect: NoExecute
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: PreferNoSchedule
+      priorityClassName: system-node-critical
+      volumes:
+      - hostPath:
+          path: /
+          type: ""
+        name: host-root
+      containers:
+      - name: anykap
+        image: alpine:3  # customize this if needed
+        # image: python:3-slim  # Use a image with Python installed if no chroot
+        resources:
+          limits:
+            cpu: 100m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        env:
+        - name: ANYKAP_DATAPATH  # artifacts will be saved in this path
+          value: "/var/lib/anykap/httpprobetimeout"
+        - name: ANYKAP_SERVERPATH  # replserver unix socket listening path
+          value: "/var/run/anykap-httpprobetimeout.sock"
+        envFrom:
+        - configMapRef:
+            name: env
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /host
+          name: host-root
+        command:
+          - chroot
+          - /host
+          - python3
+          - -c
+          - |
+            $(envimporter.py)
+            install_envimporter(valid_prefix="anykap")
+            $(capture.py)
