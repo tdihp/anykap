@@ -17,14 +17,16 @@ Things captured:
 
 To use it (under anykap code root):
 
-  mkdir http_probe_timeout
-  kubectl anykap -k http_probe_timeout init httpprobetimeout
-  cp examples/http_probe_timeout/* http_probe_timeout
-  cd http_probe_timeout
-  kubectl apply -k .
-  kubectl anykap info
-  # after repro
-  kubectl anykap a --copy
+``` shell
+mkdir http_probe_timeout
+kubectl anykap -k http_probe_timeout init httpprobetimeout
+cp examples/http_probe_timeout/* http_probe_timeout
+cd http_probe_timeout
+kubectl apply -k .
+kubectl anykap info
+# after repro
+kubectl anykap a --copy
+```
 
 [repro.yaml](./repro.yaml) is a pod which always fails http health probe with
 with a timeout, as a testing environment.
