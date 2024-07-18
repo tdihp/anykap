@@ -42,10 +42,14 @@ spec:
             cpu: 100m
             memory: 200Mi
         env:
+        - name: ANYKAP_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: ANYKAP_DATAPATH  # artifacts will be saved in this path
-          value: "/var/lib/anykap/{name}"
+          value: "/var/lib/anykap/$(ANYKAP_NAMESPACE)/{name}"
         - name: ANYKAP_SERVERPATH  # replserver unix socket listening path
-          value: "/var/run/anykap-{name}.sock"
+          value: "/var/run/anykap-$(ANYKAP_NAMESPACE)-{name}.sock"
         envFrom:
         - configMapRef:
             name: env

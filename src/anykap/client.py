@@ -161,7 +161,9 @@ class Client:
         logger.debug("args: %s, kubectl_args: %s", args, kubectl_args)
         if args.namespace:
             logger.warning(
-                "namespace %r is specified in commandline, ignored", args.namespace
+                "namespace %r is specified in commandline, ignored, "
+                "modify kustomization.yaml to specify namespace",
+                args.namespace,
             )
         self.args = args
         self.kubectl_args = tuple(kubectl_args)
@@ -256,13 +258,16 @@ class Client:
         )
         return namespace, output["items"]
 
-    def repl_req(self, pod_locator, args):
+    def repl_req(self, namespace, pod, args):
+        pod_locator = ("-n", namespace, pod)
         kubectl_args = self.kubectl_args
         metadata = self.metadata
         name = metadata["name"]
         req_kw = {
             "chroot": metadata.get("chroot", ""),
-            "sockpath": metadata.get("serverpath", f"/var/run/anykap-{name}.sock"),
+            "sockpath": metadata.get(
+                "serverpath", f"/var/run/anykap-{namespace}-{name}.sock"
+            ),
         }
         return repl_req(pod_locator + kubectl_args, args, **req_kw)
 
@@ -285,13 +290,12 @@ class Client:
 
     def query_nodes(self, repl_query):
         for node, namespace, pod in self.iter_nodes():
-            pod_locator = ("-n", namespace, pod)
             try:
-                result = self.repl_req(pod_locator, repl_query)
+                result = self.repl_req(namespace, pod, repl_query)
             except Exception:
                 logger.exception("failed when querying node %s", node)
                 continue
-            yield node, result, pod_locator
+            yield node, result, namespace, pod
 
     def cmd_init(self):
         parser = self.parser
@@ -313,7 +317,7 @@ class Client:
 
     def cmd_info(self):
         results = {}
-        for node, result, pod_locator in self.query_nodes(("-ojson", "info")):
+        for node, result, namespace, pod in self.query_nodes(("-ojson", "info")):
             (result0,) = result
             results[node] = json.loads(result0)
         pprint.pprint(results)
@@ -333,7 +337,7 @@ class Client:
             query += ("-a",)
         if args.name:
             query += tuple(args.name)
-        for node, result, pod_locator in self.query_nodes(query):
+        for node, result, namespace, pod in self.query_nodes(query):
             (result0,) = result
             results[node] = json.loads(result0)
         pprint.pprint(results)
@@ -360,11 +364,12 @@ class Client:
             artifacts_path.mkdir(exist_ok=True)
 
         results = {}
-        for node, result, pod_locator in self.query_nodes(query):
+        for node, result, namespace, pod in self.query_nodes(query):
             (result0,) = result
             artifacts = json.loads(result0)["items"]
             results[node] = artifacts
             if args.copy:
+                pod_locator = ("-n", namespace, pod)
                 outcome = []
                 results[node] = outcome
                 for a in artifacts:
